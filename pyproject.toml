@@ -1,0 +1,23 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:src.*"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["src/**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+# The brief asks for Python 3.7+. Lambda runs 3.12, but pinning the lint target
+# low keeps the modernisation rules from suggesting syntax that would break the
+# stated floor (datetime.UTC is 3.11+, zip(strict=) is 3.10+).
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]

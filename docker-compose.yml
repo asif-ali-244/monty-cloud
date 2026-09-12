@@ -1,0 +1,22 @@
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: monty-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,dynamodb,lambda,apigateway,iam,sts,logs,cloudwatch
+      DEBUG: ${DEBUG:-0}
+      PERSISTENCE: 0
+      # Lambdas run as sibling containers on the host Docker daemon.
+      LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT: 90
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - "./.localstack:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

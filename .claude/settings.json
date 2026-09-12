@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "aws-serverless@claude-plugins-official": true
+  }
+}
