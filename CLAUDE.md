@@ -38,5 +38,5 @@ We will use LocalStack image to emulate AWS services. Use Terraform with localst
 ### Local Emulation (LocalStack)
 * Start local infrastructure: `docker-compose up -d`
 * Verify local AWS status: `awslocal status services`/pl
-* Clear local DynamoDB data: `awslocal dynamodb delete-table --table-name LocalTable && npm run seed:local`
+* Clear local DynamoDB data
 

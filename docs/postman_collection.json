@@ -1,0 +1,352 @@
+{
+  "info": {
+    "name": "Image Service API",
+    "description": "Upload, search, retrieve and delete images.\n\nSet the `baseUrl` and `userId` collection variables, then run the requests top to bottom — `imageId` is captured automatically from the upload response and reused by everything after it.\n\nGet `baseUrl` from `terraform -chdir=terraform output -raw api_base_url`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:4566/restapis/REPLACE_ME/local/_user_request_",
+      "description": "terraform -chdir=terraform output -raw api_base_url"
+    },
+    {
+      "key": "userId",
+      "value": "alice",
+      "description": "Development stand-in for an authenticated identity."
+    },
+    {
+      "key": "imageId",
+      "value": "",
+      "description": "Captured from the upload response."
+    },
+    {
+      "key": "pngBase64",
+      "value": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "description": "A 1x1 PNG, so the collection runs without a local file."
+    }
+  ],
+  "item": [
+    {
+      "name": "Upload image",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.test('returns an imageId', () => pm.expect(body.imageId).to.match(/^[0-9a-f]{32}$/));",
+              "pm.test('records the uploader', () => pm.expect(body.userId).to.eql(pm.collectionVariables.get('userId')));",
+              "pm.test('normalises tags', () => pm.expect(body.tags).to.eql(['beach', 'sunset']));",
+              "pm.test('hides storage internals', () => pm.expect(body).to.not.have.property('s3Key'));",
+              "pm.collectionVariables.set('imageId', body.imageId);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-User-Id", "value": "{{userId}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"filename\": \"sunset.png\",\n  \"contentType\": \"image/png\",\n  \"imageBase64\": \"{{pngBase64}}\",\n  \"tags\": [\"beach\", \"sunset\"],\n  \"description\": \"Golden hour\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/images", "host": ["{{baseUrl}}"], "path": ["images"] },
+        "description": "Stores the image in S3 and its metadata in DynamoDB. The declared contentType is verified against the file's magic bytes."
+      }
+    },
+    {
+      "name": "Upload — rejects a type mismatch",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+              "pm.test('explains why', () => pm.expect(pm.response.json().error).to.include('does not match the declared contentType'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-User-Id", "value": "{{userId}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"filename\": \"not-really.png\",\n  \"contentType\": \"image/png\",\n  \"imageBase64\": \"JVBERi0xLjcgbm90IHJlYWxseSBhIHBuZw==\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/images", "host": ["{{baseUrl}}"], "path": ["images"] },
+        "description": "A PDF renamed to .png is rejected, not stored."
+      }
+    },
+    {
+      "name": "List all images",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('returns a page', () => pm.expect(body).to.have.all.keys('items', 'count', 'nextToken'));",
+              "pm.test('count matches the page', () => pm.expect(body.count).to.eql(body.items.length));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images?limit=25",
+          "host": ["{{baseUrl}}"],
+          "path": ["images"],
+          "query": [{ "key": "limit", "value": "25" }]
+        },
+        "description": "No userId means there is no partition key to anchor on, so this is a bounded, paginated Scan."
+      }
+    },
+    {
+      "name": "List — filter by user and tag",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const items = pm.response.json().items;",
+              "pm.test('every result matches both filters', () => items.forEach(i => {",
+              "  pm.expect(i.userId).to.eql(pm.collectionVariables.get('userId'));",
+              "  pm.expect(i.tags).to.include('beach');",
+              "}));",
+              "pm.test('newest first', () => {",
+              "  const dates = items.map(i => i.uploadedAt);",
+              "  pm.expect(dates).to.eql([...dates].sort().reverse());",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images?userId={{userId}}&tag=beach&limit=10",
+          "host": ["{{baseUrl}}"],
+          "path": ["images"],
+          "query": [
+            { "key": "userId", "value": "{{userId}}", "description": "Indexed — turns this into a Query." },
+            { "key": "tag", "value": "beach" },
+            { "key": "limit", "value": "10" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "List — filter by date range",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images?userId={{userId}}&uploadedFrom=2020-01-01T00:00:00Z&uploadedTo=2030-12-31T23:59:59Z",
+          "host": ["{{baseUrl}}"],
+          "path": ["images"],
+          "query": [
+            { "key": "userId", "value": "{{userId}}" },
+            { "key": "uploadedFrom", "value": "2020-01-01T00:00:00Z" },
+            { "key": "uploadedTo", "value": "2030-12-31T23:59:59Z" }
+          ]
+        },
+        "description": "Combined with userId, the date range is a key condition on the GSI rather than a post-read filter."
+      }
+    },
+    {
+      "name": "List — rejects a bad cursor",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+              "pm.test('names the parameter', () => pm.expect(pm.response.json().error).to.include('nextToken'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images?nextToken=not-a-real-token",
+          "host": ["{{baseUrl}}"],
+          "path": ["images"],
+          "query": [{ "key": "nextToken", "value": "not-a-real-token" }]
+        }
+      }
+    },
+    {
+      "name": "Get image metadata",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('is the uploaded image', () => pm.expect(pm.response.json().imageId).to.eql(pm.collectionVariables.get('imageId')));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images/{{imageId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "{{imageId}}"]
+        }
+      }
+    },
+    {
+      "name": "Get image metadata — unknown id",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+              "pm.test('code is NotFound', () => pm.expect(pm.response.json().code).to.eql('NotFound'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images/00000000000000000000000000000000",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "00000000000000000000000000000000"]
+        }
+      }
+    },
+    {
+      "name": "Download — follow the redirect",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Postman follows redirects by default, so this lands on the S3 response.",
+              "pm.test('200 OK after the redirect', () => pm.response.to.have.status(200));",
+              "pm.test('is a PNG', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('image/png'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images/{{imageId}}/content",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "{{imageId}}", "content"]
+        },
+        "description": "302 to a presigned S3 URL. Turn off 'Automatically follow redirects' in Postman settings to inspect the 302 itself."
+      }
+    },
+    {
+      "name": "Download — URL as JSON",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('returns a signed URL', () => pm.expect(body.downloadUrl).to.include('X-Amz-Signature'));",
+              "pm.test('honours expiresIn', () => pm.expect(body.expiresInSeconds).to.eql(60));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/images/{{imageId}}/content?redirect=false&expiresIn=60",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "{{imageId}}", "content"],
+          "query": [
+            { "key": "redirect", "value": "false" },
+            { "key": "expiresIn", "value": "60" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Delete image",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('204 No Content', () => pm.response.to.have.status(204));",
+              "pm.test('no body', () => pm.expect(pm.response.text()).to.be.empty);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "X-User-Id", "value": "{{userId}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/images/{{imageId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "{{imageId}}"]
+        }
+      }
+    },
+    {
+      "name": "Delete image — already deleted",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404, not a silent 204', () => pm.response.to.have.status(404));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "X-User-Id", "value": "{{userId}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/images/{{imageId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["images", "{{imageId}}"]
+        },
+        "description": "Deleting twice reports 404 rather than pretending the call did work."
+      }
+    }
+  ]
+}

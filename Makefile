@@ -4,7 +4,7 @@ PY := .venv/bin/python
 TF := terraform -chdir=terraform
 
 .DEFAULT_GOAL := help
-.PHONY: help install test cov lint fmt package up down logs wait deploy plan destroy outputs seed smoke clean
+.PHONY: help install test cov lint fmt package up down logs wait deploy plan destroy outputs seed smoke docs clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -70,6 +70,10 @@ seed: ## Load sample images through the deployed API
 
 smoke: ## Run the end-to-end check against the deployed API
 	$(PY) scripts/smoke_test.py
+
+docs: ## Serve the API docs (Swagger UI) at http://localhost:8080
+	@echo "API docs on http://localhost:8080  (ctrl-c to stop)"
+	$(PY) -m http.server 8080 --directory docs --bind 127.0.0.1
 
 clean: ## Remove build artefacts and caches
 	rm -rf build .pytest_cache .ruff_cache .coverage htmlcov

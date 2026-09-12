@@ -1,0 +1,757 @@
+openapi: 3.0.3
+
+info:
+  title: Image Service API
+  version: 1.0.0
+  description: |
+    Upload, catalogue, retrieve and delete images.
+
+    Image bytes are stored in S3 and their metadata in DynamoDB. Each endpoint is
+    backed by its own Lambda function behind API Gateway.
+
+    ## Identity
+
+    The calling user is taken from the `X-User-Id` header. This is a
+    development-only stand-in: in a deployed environment an API Gateway
+    authorizer supplies the identity, and the handlers already prefer
+    `requestContext.authorizer.claims.sub` over the header, so no application
+    change is needed when one is attached.
+
+    ## Sizes
+
+    An upload carries the image as base64 inside the JSON body. Base64 inflates
+    a payload by roughly a third and API Gateway caps a proxy request at 10 MB,
+    so the decoded image must be at most 5 MB (`MAX_IMAGE_BYTES`). Downloads are
+    not bound by that limit: they redirect to a presigned S3 URL and the bytes
+    never pass through Lambda.
+
+    ## Errors
+
+    Every failure returns the same body shape - a human-readable `error` and a
+    stable machine-readable `code` - with an appropriate HTTP status.
+  contact:
+    name: monty-cloud image service
+  license:
+    name: Assessment submission
+
+servers:
+  - url: http://localhost:4566/restapis/{restApiId}/{stage}/_user_request_
+    description: LocalStack
+    variables:
+      restApiId:
+        default: fqiybc3p1p
+        description: From `terraform -chdir=terraform output -raw rest_api_id`.
+      stage:
+        default: local
+  - url: https://{restApiId}.execute-api.{region}.amazonaws.com/{stage}
+    description: AWS
+    variables:
+      restApiId:
+        default: abc123xyz0
+      region:
+        default: us-east-1
+      stage:
+        default: dev
+
+tags:
+  - name: Images
+    description: Image upload, search, retrieval and deletion.
+
+security:
+  - UserIdHeader: []
+
+paths:
+  /images:
+    post:
+      tags: [Images]
+      summary: Upload an image with its metadata
+      operationId: uploadImage
+      description: |
+        Stores the image in S3 and its metadata in DynamoDB, and returns the
+        created record.
+
+        The declared `contentType` is verified against the file's magic bytes, so
+        a non-image renamed to `.png` is rejected rather than stored.
+
+        The object is written before the metadata row. An interruption between
+        the two therefore leaves an unreferenced object - invisible to every
+        endpoint - rather than a metadata row pointing at bytes that do not
+        exist. The upload also issues a compensating delete when the metadata
+        write fails.
+      security:
+        - UserIdHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadRequest'
+            examples:
+              minimal:
+                summary: Only the required fields
+                value:
+                  filename: sunset.png
+                  contentType: image/png
+                  imageBase64: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+              full:
+                summary: With tags and a description
+                value:
+                  filename: sunset.png
+                  contentType: image/png
+                  imageBase64: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+                  tags: [beach, sunset]
+                  description: Golden hour
+              dataUrl:
+                summary: Browser data-URL form, accepted as-is
+                value:
+                  filename: sunset.png
+                  contentType: image/png
+                  imageBase64: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location:
+              description: Path of the created image.
+              schema:
+                type: string
+                example: /images/334d3b476eba4fbfa2b00e2aa4792a8a
+            Access-Control-Allow-Origin:
+              $ref: '#/components/headers/AccessControlAllowOrigin'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Image'
+              example:
+                imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
+                userId: alice
+                filename: sunset.png
+                contentType: image/png
+                sizeBytes: 70
+                checksumSha256: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
+                tags: [beach, sunset]
+                description: Golden hour
+                uploadedAt: '2026-09-12T00:43:34.500Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/StorageError'
+
+    get:
+      tags: [Images]
+      summary: List and search images
+      operationId: listImages
+      description: |
+        Returns a page of images, newest first, with cursor pagination.
+
+        Stop paging when `nextToken` is `null`, never when a page is empty:
+        `limit` bounds the rows read rather than the rows returned, so a page
+        whose rows are all removed by a filter comes back empty while matches
+        still wait behind the cursor.
+
+        Filters combine with AND. Supplying `userId` queries the
+        `userId-uploadedAt-index` GSI, and a date range then becomes a key
+        condition rather than a post-read filter, so the query cost stays
+        proportional to the number of results. Without `userId` there is no
+        partition key to anchor on and the request falls back to a bounded,
+        paginated Scan.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdFilter'
+        - $ref: '#/components/parameters/TagFilter'
+        - $ref: '#/components/parameters/ContentTypeFilter'
+        - $ref: '#/components/parameters/FilenameFilter'
+        - $ref: '#/components/parameters/UploadedFrom'
+        - $ref: '#/components/parameters/UploadedTo'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/NextToken'
+      responses:
+        '200':
+          description: 'A page of results. An empty match set is a 200 with `items` empty.'
+          headers:
+            Access-Control-Allow-Origin:
+              $ref: '#/components/headers/AccessControlAllowOrigin'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePage'
+              examples:
+                page:
+                  summary: First page of two
+                  value:
+                    items:
+                      - imageId: 1855ff4111214a2eb41276f75f431327
+                        userId: carol
+                        filename: surfboard.png
+                        contentType: image/png
+                        sizeBytes: 70
+                        checksumSha256: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
+                        tags: [beach, sports]
+                        description: Board waxed and ready
+                        uploadedAt: '2026-09-12T00:43:34.649Z'
+                    count: 1
+                    nextToken: eyJpbWFnZUlkIjogIjE4NTVmZjQxMTEyMTRhMmViNDEyNzZmNzVmNDMxMzI3In0=
+                lastPage:
+                  summary: Last page - nextToken is null
+                  value:
+                    items: []
+                    count: 0
+                    nextToken: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/StorageError'
+
+    options:
+      tags: [Images]
+      summary: CORS preflight
+      operationId: preflightImages
+      security: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Preflight'
+
+  /images/{imageId}:
+    parameters:
+      - $ref: '#/components/parameters/ImageId'
+
+    get:
+      tags: [Images]
+      summary: View one image's metadata
+      operationId: getImage
+      description: Returns the metadata record. Storage-internal attributes are never exposed.
+      security: []
+      responses:
+        '200':
+          description: The image metadata.
+          headers:
+            Access-Control-Allow-Origin:
+              $ref: '#/components/headers/AccessControlAllowOrigin'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Image'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/StorageError'
+
+    delete:
+      tags: [Images]
+      summary: Delete an image
+      operationId: deleteImage
+      description: |
+        Removes the metadata row and then the stored object.
+
+        Deleting an image that is already gone returns `404`, not `204`. A client
+        that deletes the wrong id should hear about it rather than be told the
+        call succeeded.
+
+        The metadata row is removed first because it is the source of truth for
+        whether an image exists. If the S3 delete then fails, the object is
+        orphaned and logged for reconciliation - preferable to a live metadata
+        row whose bytes have already been removed.
+      security:
+        - UserIdHeader: []
+      responses:
+        '204':
+          description: Deleted. No body.
+          headers:
+            Access-Control-Allow-Origin:
+              $ref: '#/components/headers/AccessControlAllowOrigin'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/StorageError'
+
+    options:
+      tags: [Images]
+      summary: CORS preflight
+      operationId: preflightImage
+      security: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Preflight'
+
+  /images/{imageId}/content:
+    parameters:
+      - $ref: '#/components/parameters/ImageId'
+
+    get:
+      tags: [Images]
+      summary: View or download the image file
+      operationId: downloadImage
+      description: |
+        Redirects to a short-lived presigned S3 URL, so the image bytes never
+        pass through Lambda or API Gateway - no 6 MB response cap, no compute
+        time proportional to file size, and no double-billed transfer.
+
+        The presigned URL carries a signed `Content-Type` and
+        `Content-Disposition`, so the browser renders or saves the file under its
+        original name.
+
+        Clients that cannot follow redirects should pass `redirect=false` to get
+        the URL as JSON instead.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Disposition'
+        - $ref: '#/components/parameters/ExpiresIn'
+        - $ref: '#/components/parameters/Redirect'
+      responses:
+        '302':
+          description: Redirect to the presigned S3 URL. Returned unless `redirect=false`.
+          headers:
+            Location:
+              description: Presigned S3 URL, valid for `expiresIn` seconds.
+              schema:
+                type: string
+                format: uri
+            Cache-Control:
+              description: Always `no-store` - the URL expires and must not be cached.
+              schema:
+                type: string
+                example: no-store
+            Access-Control-Allow-Origin:
+              $ref: '#/components/headers/AccessControlAllowOrigin'
+        '200':
+          description: Returned when `redirect=false`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrl'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/StorageError'
+
+components:
+  securitySchemes:
+    UserIdHeader:
+      type: apiKey
+      in: header
+      name: X-User-Id
+      description: |
+        Development stand-in for an authenticated identity. Required on `POST
+        /images` and `DELETE /images/{imageId}`. In a deployed environment an
+        API Gateway authorizer replaces it and the header is ignored.
+
+  headers:
+    AccessControlAllowOrigin:
+      description: CORS origin allowance. Currently `*`.
+      schema:
+        type: string
+        example: '*'
+
+  parameters:
+    ImageId:
+      name: imageId
+      in: path
+      required: true
+      description: Server-generated image identifier (32 hex characters).
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+      example: 334d3b476eba4fbfa2b00e2aa4792a8a
+
+    UserIdFilter:
+      name: userId
+      in: query
+      required: false
+      description: |
+        Restrict to one user's images. **Indexed** - this is the only filter that
+        turns the request into a Query instead of a Scan, and it is what makes
+        `uploadedFrom`/`uploadedTo` key conditions.
+      schema:
+        type: string
+      example: alice
+
+    TagFilter:
+      name: tag
+      in: query
+      required: false
+      description: Match a single tag. Case-insensitive; normalised the same way tags are on upload.
+      schema:
+        type: string
+      example: beach
+
+    ContentTypeFilter:
+      name: contentType
+      in: query
+      required: false
+      description: Exact match. An unsupported value is a `415`, not an empty result.
+      schema:
+        $ref: '#/components/schemas/ContentType'
+      example: image/png
+
+    FilenameFilter:
+      name: filename
+      in: query
+      required: false
+      description: Case-insensitive substring match on the original filename.
+      schema:
+        type: string
+      example: sunset
+
+    UploadedFrom:
+      name: uploadedFrom
+      in: query
+      required: false
+      description: Inclusive lower bound, ISO-8601. Naive timestamps are read as UTC.
+      schema:
+        type: string
+        format: date-time
+      example: '2026-01-01T00:00:00Z'
+
+    UploadedTo:
+      name: uploadedTo
+      in: query
+      required: false
+      description: Inclusive upper bound, ISO-8601.
+      schema:
+        type: string
+        format: date-time
+      example: '2026-12-31T23:59:59Z'
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Page size. Values above the maximum are capped, not rejected.
+
+        This bounds the rows the database reads, not the rows returned: with a
+        post-read filter (`tag`, `contentType`, `filename`) a page can come back
+        empty and still carry a `nextToken`.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+
+    NextToken:
+      name: nextToken
+      in: query
+      required: false
+      description: |
+        Cursor from the previous response. Opaque - pass it back verbatim. A
+        malformed token is a `400`.
+      schema:
+        type: string
+
+    Disposition:
+      name: disposition
+      in: query
+      required: false
+      description: '`inline` renders in the browser; `attachment` prompts a save.'
+      schema:
+        type: string
+        enum: [inline, attachment]
+        default: inline
+
+    ExpiresIn:
+      name: expiresIn
+      in: query
+      required: false
+      description: Lifetime of the presigned URL in seconds. Values above the maximum are capped.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3600
+        default: 900
+
+    Redirect:
+      name: redirect
+      in: query
+      required: false
+      description: '`false` returns the URL as JSON instead of a `302`.'
+      schema:
+        type: boolean
+        default: true
+
+  schemas:
+    ContentType:
+      type: string
+      description: Accepted image media types.
+      enum:
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+
+    UploadRequest:
+      type: object
+      required: [filename, contentType, imageBase64]
+      additionalProperties: false
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: |
+            Original file name. Any directory component is stripped before
+            storage, so `../../etc/passwd.png` is recorded as `passwd.png`. The
+            client never influences the S3 key.
+          example: sunset.png
+        contentType:
+          $ref: '#/components/schemas/ContentType'
+        imageBase64:
+          type: string
+          description: |
+            Base64-encoded image, or a `data:<type>;base64,<payload>` URL. Must
+            decode to at most 5 MB and must begin with magic bytes matching
+            `contentType`.
+          example: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+        tags:
+          type: array
+          maxItems: 20
+          description: |
+            Lowercased, trimmed and de-duplicated on write. A comma-separated
+            string is also accepted. Each tag matches `[a-z0-9][a-z0-9_-]*`.
+          items:
+            type: string
+            maxLength: 50
+            pattern: '^[a-z0-9][a-z0-9_-]*$'
+          example: [beach, sunset]
+        description:
+          type: string
+          maxLength: 1024
+          example: Golden hour
+
+    Image:
+      type: object
+      description: |
+        An image metadata record. `s3Key` and `s3Bucket` exist on the stored item
+        but are stripped from every response.
+      required:
+        - imageId
+        - userId
+        - filename
+        - contentType
+        - sizeBytes
+        - checksumSha256
+        - tags
+        - uploadedAt
+      properties:
+        imageId:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          description: Server-generated. Two concurrent uploads never collide.
+          example: 334d3b476eba4fbfa2b00e2aa4792a8a
+        userId:
+          type: string
+          description: The uploader, taken from the authorizer or `X-User-Id`.
+          example: alice
+        filename:
+          type: string
+          example: sunset.png
+        contentType:
+          $ref: '#/components/schemas/ContentType'
+        sizeBytes:
+          type: integer
+          description: Size of the decoded image.
+          example: 70
+        checksumSha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 of the stored bytes; lets a client verify a download.
+          example: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
+        tags:
+          type: array
+          items:
+            type: string
+          example: [beach, sunset]
+        description:
+          type: string
+          description: Present only when supplied at upload.
+          example: Golden hour
+        uploadedAt:
+          type: string
+          format: date-time
+          description: |
+            UTC, millisecond precision, always `Z`-suffixed. This canonical form
+            sorts lexicographically, which is what allows it to serve as the GSI
+            sort key and to support range filters.
+          example: '2026-09-12T00:43:34.500Z'
+
+    ImagePage:
+      type: object
+      required: [items, count, nextToken]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Image'
+        count:
+          type: integer
+          description: |
+            Number of items in this page, not the total match count. May be 0
+            while `nextToken` is non-null - do not use it to decide whether to
+            stop paging.
+          example: 1
+        nextToken:
+          type: string
+          nullable: true
+          description: |
+            Cursor for the next page, or null on the last page. This is the only
+            correct signal for whether more results exist.
+
+    DownloadUrl:
+      type: object
+      required: [downloadUrl, expiresInSeconds, image]
+      properties:
+        downloadUrl:
+          type: string
+          format: uri
+          description: Presigned S3 URL with signed response headers.
+        expiresInSeconds:
+          type: integer
+          example: 900
+        image:
+          $ref: '#/components/schemas/Image'
+
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          description: Human-readable message. Safe to show a caller; never contains internals.
+        code:
+          type: string
+          description: Stable identifier to branch on.
+          enum:
+            - ValidationError
+            - NotFound
+            - Conflict
+            - PayloadTooLarge
+            - UnsupportedMediaType
+            - StorageError
+            - InternalError
+
+  responses:
+    Preflight:
+      description: CORS preflight, answered by a mock integration.
+      headers:
+        Access-Control-Allow-Origin:
+          $ref: '#/components/headers/AccessControlAllowOrigin'
+        Access-Control-Allow-Methods:
+          schema:
+            type: string
+            example: GET,POST,OPTIONS
+        Access-Control-Allow-Headers:
+          schema:
+            type: string
+            example: Content-Type,X-User-Id
+
+    BadRequest:
+      description: |
+        The request failed validation: a malformed or missing body field, an
+        unparseable filter, a bad `nextToken`, or a missing caller identity.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            missingField:
+              value:
+                error: "'filename' is required"
+                code: ValidationError
+            contentMismatch:
+              summary: Declared type contradicts the file's magic bytes
+              value:
+                error: "File content does not match the declared contentType 'image/png'"
+                code: ValidationError
+            badToken:
+              value:
+                error: "'nextToken' is not a valid pagination token"
+                code: ValidationError
+            noIdentity:
+              value:
+                error: 'Caller identity missing: supply the X-User-Id header'
+                code: ValidationError
+
+    NotFound:
+      description: No image with that id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' was not found"
+            code: NotFound
+
+    Conflict:
+      description: An image with that id already exists. Not reachable in normal use.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' already exists"
+            code: Conflict
+
+    PayloadTooLarge:
+      description: The decoded image exceeds `MAX_IMAGE_BYTES`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Image is 8388608 bytes; the limit is 5242880 bytes
+            code: PayloadTooLarge
+
+    UnsupportedMediaType:
+      description: '`contentType` is not an accepted image type.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "'contentType' must be one of: image/gif, image/jpeg, image/png, image/webp"
+            code: UnsupportedMediaType
+
+    StorageError:
+      description: A downstream S3 or DynamoDB call failed. Retryable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Could not persist image metadata
+            code: StorageError
+
+    InternalError:
+      description: |
+        Unexpected failure. The message carries only a request id, which
+        correlates with the CloudWatch log entry holding the stack trace.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: 'Internal server error. Reference: 8f2c1a4e-6b9d-4c3a-9f11-2d7e5a0b4c88'
+            code: InternalError

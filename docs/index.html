@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Image Service API</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css"
+    />
+    <style>
+      body { margin: 0; background: #fafafa; }
+      .topbar { display: none; }
+      .swagger-ui .info { margin: 24px 0; }
+      #fallback {
+        display: none;
+        font: 14px/1.6 system-ui, sans-serif;
+        max-width: 40rem;
+        margin: 4rem auto;
+        padding: 0 1rem;
+        color: #333;
+      }
+      #fallback code {
+        background: #eee;
+        padding: 0.1em 0.35em;
+        border-radius: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <div id="fallback">
+      <h1>Swagger UI could not load</h1>
+      <p>
+        This page pulls Swagger UI from a CDN and needs network access. Offline,
+        read <code>docs/API.md</code> for the full reference, or open
+        <code>docs/openapi.yaml</code> in any OpenAPI viewer.
+      </p>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+    <script>
+      if (window.SwaggerUIBundle) {
+        SwaggerUIBundle({
+          url: "openapi.yaml",
+          dom_id: "#swagger-ui",
+          deepLinking: true,
+          displayRequestDuration: true,
+          tryItOutEnabled: true,
+          defaultModelsExpandDepth: 1,
+          docExpansion: "list",
+        });
+      } else {
+        document.getElementById("fallback").style.display = "block";
+      }
+    </script>
+  </body>
+</html>

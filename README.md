@@ -27,8 +27,8 @@ DynamoDB (metadata), with Terraform and LocalStack for a full local stack.
 
 - **Language / runtime**: Python (Lambda `python3.12`; source targets 3.7+ syntax)
 - **Infrastructure**: Terraform, one configuration for both LocalStack and AWS
-- **Tests**: 177 unit tests against [moto](https://github.com/getmoto/moto), 100% line coverage,
-  plus a live end-to-end smoke test
+- **Tests**: 201 unit tests against [moto](https://github.com/getmoto/moto), 100% line coverage,
+  plus OpenAPI contract tests and a live end-to-end smoke test
 
 ---
 
@@ -38,7 +38,7 @@ Requires Docker, Terraform ≥ 1.5 and Python 3.9+.
 
 ```bash
 make install     # virtualenv + dev dependencies
-make test        # 177 unit tests, no AWS or Docker needed
+make test        # 201 unit tests, no AWS or Docker needed
 make up          # start LocalStack, wait for health
 make deploy      # package the Lambdas and terraform apply
 make seed        # load six sample images
@@ -56,151 +56,51 @@ Tear down with `make destroy && make down`. `make help` lists every target.
 
 ---
 
-## API reference
+## API
 
-Base path: `{API}`. All request and response bodies are JSON.
+Full reference: **[docs/API.md](docs/API.md)**. Machine-readable spec:
+**[docs/openapi.yaml](docs/openapi.yaml)** (OpenAPI 3.0.3). Postman collection:
+**[docs/postman_collection.json](docs/postman_collection.json)**.
 
-The caller is identified by the **`X-User-Id`** header. In a deployed
-environment this is replaced by an API Gateway authorizer — the handlers already
-read `requestContext.authorizer.claims.sub` in preference to the header, so
-attaching Cognito requires no application change.
-
-### `POST /images` — upload an image with metadata
-
-| Field | Type | Required | Notes |
+| Method | Path | Purpose | Success |
 |---|---|---|---|
-| `filename` | string | yes | ≤ 255 chars; any directory component is stripped |
-| `contentType` | string | yes | `image/jpeg`, `image/png`, `image/gif`, `image/webp` |
-| `imageBase64` | string | yes | Base64, or a `data:image/png;base64,…` URL. ≤ 5 MB decoded |
-| `tags` | string[] | no | ≤ 20 tags, `[a-z0-9][a-z0-9_-]*`; lowercased and de-duplicated |
-| `description` | string | no | ≤ 1024 chars |
+| `POST` | `/images` | Upload an image with metadata | `201` |
+| `GET` | `/images` | List and search | `200` |
+| `GET` | `/images/{imageId}` | View metadata | `200` |
+| `GET` | `/images/{imageId}/content` | View or download the file | `302` |
+| `DELETE` | `/images/{imageId}` | Delete an image | `204` |
+
+Search filters — combined with AND, all optional: `userId` (indexed), `tag`,
+`contentType`, `filename`, `uploadedFrom`/`uploadedTo`, plus `limit` and
+`nextToken` for cursor pagination.
+
+The caller is identified by the `X-User-Id` header, a development stand-in for
+an authorizer. Errors are uniform — `{"error": "…", "code": "…"}` — with the
+status codes listed in [the error reference](docs/API.md#errors).
 
 ```bash
-curl -sS -X POST "$API/images" \
-  -H 'Content-Type: application/json' \
-  -H 'X-User-Id: alice' \
-  -d "{
-        \"filename\": \"sunset.png\",
-        \"contentType\": \"image/png\",
-        \"imageBase64\": \"$(base64 < sunset.png | tr -d '\n')\",
-        \"tags\": [\"beach\", \"sunset\"],
-        \"description\": \"Golden hour\"
-      }"
-```
+export API=$(terraform -chdir=terraform output -raw api_base_url)
 
-`201 Created`, with `Location: /images/{imageId}`:
+curl -sS -X POST "$API/images" -H 'Content-Type: application/json' -H 'X-User-Id: alice' \
+  -d "{\"filename\":\"sunset.png\",\"contentType\":\"image/png\",
+       \"imageBase64\":\"$(base64 < sunset.png | tr -d '\n')\",\"tags\":[\"beach\"]}"
 
-```json
-{
-  "imageId": "334d3b476eba4fbfa2b00e2aa4792a8a",
-  "userId": "alice",
-  "filename": "sunset.png",
-  "contentType": "image/png",
-  "sizeBytes": 70,
-  "checksumSha256": "c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77",
-  "tags": ["beach", "sunset"],
-  "description": "Golden hour",
-  "uploadedAt": "2026-09-12T00:43:34.500Z"
-}
-```
-
-The declared `contentType` is checked against the file's magic bytes, so a
-renamed PDF is rejected with `400`, not stored.
-
-### `GET /images` — list and search
-
-| Query parameter | Example | Behaviour |
-|---|---|---|
-| `userId` | `alice` | **Indexed.** Queries the GSI; results are newest-first |
-| `uploadedFrom` / `uploadedTo` | `2024-05-01T00:00:00Z` | ISO-8601. A key condition when combined with `userId`, otherwise a filter |
-| `tag` | `beach` | Matches one tag, case-insensitive |
-| `contentType` | `image/png` | Exact match |
-| `filename` | `sun` | Case-insensitive substring |
-| `limit` | `25` | 1–100, default 25 |
-| `nextToken` | *(opaque)* | Cursor from the previous page |
-
-Filters combine with AND.
-
-```bash
 curl -sS "$API/images?userId=alice&tag=beach&limit=10"
-curl -sS "$API/images?uploadedFrom=2026-01-01T00:00:00Z&contentType=image/png"
+curl -sSL "$API/images/$ID/content" -o downloaded.png
+curl -sS -X DELETE "$API/images/$ID" -H 'X-User-Id: alice'
 ```
 
-```json
-{
-  "items": [ { "imageId": "…", "filename": "beach-sunset.png", "…": "…" } ],
-  "count": 1,
-  "nextToken": "eyJpbWFnZUlkIjogIjMzNGQzYjQ3…"
-}
-```
-
-`nextToken` is `null` on the last page. Pass it back verbatim to continue:
+Browse the spec in Swagger UI, with the LocalStack server preselected so requests
+can be fired from the page:
 
 ```bash
-curl -sS "$API/images?userId=alice&limit=2&nextToken=$TOKEN"
+make docs   # http://localhost:8080
 ```
 
-### `GET /images/{imageId}` — view metadata
-
-```bash
-curl -sS "$API/images/334d3b476eba4fbfa2b00e2aa4792a8a"
-```
-
-`200` with the same object as the upload response, or `404`.
-
-### `GET /images/{imageId}/content` — view or download the file
-
-Returns `302` to a presigned S3 URL, so the bytes never pass through Lambda or
-API Gateway.
-
-| Query parameter | Default | Behaviour |
-|---|---|---|
-| `disposition` | `inline` | `attachment` makes the browser save rather than render |
-| `expiresIn` | `900` | URL lifetime in seconds, capped at 3600 |
-| `redirect` | `true` | `false` returns the URL as JSON instead of redirecting |
-
-```bash
-curl -sSL "$API/images/$ID/content" -o downloaded.png          # follow the redirect
-curl -sS  "$API/images/$ID/content?disposition=attachment" -D - # inspect the 302
-curl -sS  "$API/images/$ID/content?redirect=false"              # get the URL as JSON
-```
-
-```json
-{
-  "downloadUrl": "http://localhost:4566/monty-images-local-bucket/images/alice/…",
-  "expiresInSeconds": 900,
-  "image": { "imageId": "…", "…": "…" }
-}
-```
-
-### `DELETE /images/{imageId}` — delete
-
-```bash
-curl -sS -X DELETE "$API/images/$ID" -o /dev/null -w '%{http_code}\n'
-```
-
-`204` on success, `404` if it was already gone. Deleting twice is deliberately
-**not** treated as success — a client that deletes the wrong id should hear about it.
-
-### Errors
-
-Every failure returns the same shape with an appropriate status:
-
-```json
-{ "error": "'contentType' must be one of: image/gif, image/jpeg, image/png, image/webp",
-  "code": "UnsupportedMediaType" }
-```
-
-| Status | `code` | Cause |
-|---|---|---|
-| 400 | `ValidationError` | Malformed body, bad filter, bad `nextToken`, missing caller id |
-| 404 | `NotFound` | No such image |
-| 409 | `Conflict` | Image id collision |
-| 413 | `PayloadTooLarge` | Image over `MAX_IMAGE_BYTES` |
-| 415 | `UnsupportedMediaType` | `contentType` not an accepted image type |
-| 502 | `StorageError` | S3 or DynamoDB call failed |
-| 500 | `InternalError` | Unexpected — the message carries a request id for the logs, nothing else |
-
+The spec is not decoration: `tests/test_openapi_contract.py` validates every real
+handler response against its documented schema and checks every documented limit
+and enum against the constant the code enforces, so the docs cannot drift from
+the implementation without a test failing.
 ---
 
 ## Data model
@@ -296,7 +196,7 @@ rather than at import so tests can vary it without reimporting modules.
 ## Testing
 
 ```bash
-make test    # 177 tests, ~17s
+make test    # 201 tests, ~18s
 make cov     # with a coverage report
 make lint    # ruff + terraform fmt
 ```
@@ -306,6 +206,12 @@ They cover the five handlers end to end, the service and repository layers, all
 validation rules, pagination, every filter combination, multi-user concurrency,
 and the AWS-failure paths (each `ClientError` mapped to its HTTP status,
 including the compensating delete and the double-failure case).
+
+`tests/test_openapi_contract.py` keeps the documentation honest: it validates
+`docs/openapi.yaml` as an OpenAPI document, validates every example in it against
+its own schema, validates real handler responses against their documented
+schemas, and asserts that every documented limit, default and enum matches the
+constant the code actually enforces.
 
 Run a single test or a subset:
 
@@ -346,8 +252,9 @@ src/
   services/     image_service (business logic), metadata_repository (DynamoDB), object_store (S3)
   common/       config, errors, validation, response builders, the handler decorator
 terraform/      storage.tf, lambda.tf (functions + IAM), apigateway.tf, variables, outputs
-tests/          177 unit tests
+tests/          201 unit tests, including the OpenAPI contract suite
 scripts/        package.sh, seed_local.py, smoke_test.py
+docs/           API.md (reference), openapi.yaml (OpenAPI 3.0.3), postman_collection.json
 ```
 
 Handlers are 5–20 lines. The `@api_handler` decorator in

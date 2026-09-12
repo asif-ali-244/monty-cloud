@@ -252,3 +252,43 @@ def test_user_query_with_only_a_lower_bound(catalogue, context):
         context,
     )
     assert ids(response) == ["img-3"]
+
+
+def test_a_filtered_page_can_be_empty_while_matches_remain(catalogue, context):
+    """`limit` bounds rows READ, not rows RETURNED.
+
+    DynamoDB applies FilterExpression after the read, so a page whose rows all
+    fail the filter comes back empty with a non-null nextToken. A client that
+    stops at the first empty page silently loses results, which is why the
+    documented contract is "follow the cursor until nextToken is null".
+    """
+    first = body_of(
+        list_images.handler(
+            api_event("GET", query={"userId": "alice", "tag": "beach", "limit": "2"}), context
+        )
+    )
+    # img-3 and img-2 are read and both filtered out; img-1 is the only match.
+    assert first["items"] == []
+    assert first["count"] == 0
+    assert first["nextToken"] is not None
+
+    second = body_of(
+        list_images.handler(
+            api_event(
+                "GET",
+                query={
+                    "userId": "alice",
+                    "tag": "beach",
+                    "limit": "2",
+                    "nextToken": first["nextToken"],
+                },
+            ),
+            context,
+        )
+    )
+    assert ids_of(second) == ["img-1"]
+    assert second["nextToken"] is None
+
+
+def ids_of(body):
+    return [item["imageId"] for item in body["items"]]
