@@ -9,7 +9,8 @@ localstack_endpoint      = "http://localhost:4566"
 lambda_internal_endpoint = "http://localhost.localstack.cloud:4566"
 s3_public_endpoint       = "http://localhost:4566"
 
-max_image_bytes          = 5242880
+max_image_bytes          = 20971520
+upload_url_ttl_seconds   = 900
 download_url_ttl_seconds = 900
 log_level                = "INFO"
 

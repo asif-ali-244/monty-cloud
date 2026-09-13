@@ -64,11 +64,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "images" {
 resource "aws_s3_bucket_cors_configuration" "images" {
   bucket = aws_s3_bucket.images.id
 
-  # Presigned download URLs are fetched directly by the browser, so the bucket
-  # itself has to answer the preflight - the API's CORS headers do not apply here.
+  # Browsers talk to the bucket directly in both directions - presigned POST to
+  # upload, presigned GET to download - so the bucket itself has to answer the
+  # preflight; the API's CORS headers do not apply here.
   cors_rule {
     allowed_headers = ["*"]
-    allowed_methods = ["GET", "HEAD"]
+    allowed_methods = ["GET", "HEAD", "POST"]
     allowed_origins = ["*"]
     expose_headers  = ["Content-Length", "Content-Type", "Content-Disposition"]
     max_age_seconds = 3000
@@ -105,6 +106,9 @@ resource "aws_dynamodb_table" "images" {
   # The dominant read pattern: one user's images, newest first, optionally
   # narrowed to a date window. ISO-8601 sorts lexicographically, so the date
   # filter is a key condition rather than a post-read filter.
+  #
+  # Sparse by design: uploadedAt is only written once an upload is verified, so
+  # pending and rejected rows never enter the index and need no filtering out.
   global_secondary_index {
     name            = "userId-uploadedAt-index"
     hash_key        = "userId"
@@ -116,8 +120,10 @@ resource "aws_dynamodb_table" "images" {
     enabled = !var.use_localstack
   }
 
+  # Pending rows whose upload never arrives, and rejected rows once their reason
+  # has been readable for a day, expire on their own. Ready rows carry no expiresAt.
   ttl {
     attribute_name = "expiresAt"
-    enabled        = false
+    enabled        = true
   }
 }

@@ -66,20 +66,52 @@ def test_orphaned_object_does_not_fail_the_delete(aws, context, stored_image, mo
 
 
 def test_deleting_one_image_leaves_the_others(aws, context, upload_payload, stored_image):
-    from src.handlers import upload_image
+    from tests.conftest import PNG_BYTES, complete_upload
 
-    other = body_of(
-        upload_image.handler(
-            api_event("POST", body=upload_payload(filename="other.png")), context
-        )
-    )
+    other = complete_upload(context, upload_payload(filename="other.png"), PNG_BYTES)
     delete_image.handler(
         api_event("DELETE", path_parameters=path(stored_image["imageId"])), context
     )
-    assert s3_keys() == ["images/user-alice/{}.png".format(other["imageId"])]
+    assert s3_keys() == [f"images/user-alice/{other['imageId']}.png"]
     assert (
         get_image.handler(api_event("GET", path_parameters=path(other["imageId"])), context)[
             "statusCode"
         ]
         == 200
     )
+
+
+def test_deletes_a_pending_image_that_has_no_object_yet(aws, context, pending_image):
+    image_id = pending_image["image"]["imageId"]
+    response = delete_image.handler(api_event("DELETE", path_parameters=path(image_id)), context)
+
+    assert response["statusCode"] == 204
+    assert get_image.handler(api_event("GET", path_parameters=path(image_id)), context)[
+        "statusCode"
+    ] == 404
+
+
+def test_deletes_a_rejected_image(aws, context, upload_payload):
+    from tests.conftest import PDF_BYTES, client_upload, process, register
+
+    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    process(context, client_upload(registered, PDF_BYTES))
+    image_id = registered["image"]["imageId"]
+
+    response = delete_image.handler(api_event("DELETE", path_parameters=path(image_id)), context)
+    assert response["statusCode"] == 204
+
+
+def test_upload_arriving_after_delete_is_cleaned_up(aws, context, pending_image):
+    """Delete wins: a late upload for a deleted image does not resurrect it."""
+    from tests.conftest import PNG_BYTES, client_upload, process
+
+    image_id = pending_image["image"]["imageId"]
+    delete_image.handler(api_event("DELETE", path_parameters=path(image_id)), context)
+    key = client_upload(pending_image, PNG_BYTES)
+    process(context, key)
+
+    assert s3_keys() == []
+    assert get_image.handler(api_event("GET", path_parameters=path(image_id)), context)[
+        "statusCode"
+    ] == 404

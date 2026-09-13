@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Seed LocalStack with a few images so the list filters have something to show.
 
-Talks to the deployed API rather than to DynamoDB directly, so seeding exercises
-the same validation path as a real client.
+Goes through the same path as a real client - register via the API, upload
+straight to S3 on the presigned POST, wait for the processor - rather than
+writing to DynamoDB directly, so seeding exercises validation end to end.
 """
 
 import argparse
@@ -10,8 +11,10 @@ import base64
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+import uuid
 
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
@@ -38,24 +41,60 @@ def terraform_output(name):
     return result.stdout.strip()
 
 
-def post_image(base_url, user, filename, tags, description):
-    payload = json.dumps(
-        {
-            "filename": filename,
-            "contentType": "image/png",
-            "imageBase64": base64.b64encode(PNG_1X1).decode(),
-            "tags": tags,
-            "description": description,
-        }
-    ).encode()
+def api(base_url, method, path, user, body=None):
     request = urllib.request.Request(
-        "{}/images".format(base_url.rstrip("/")),
-        data=payload,
+        f"{base_url.rstrip('/')}{path}",
+        data=json.dumps(body).encode() if body is not None else None,
         headers={"Content-Type": "application/json", "X-User-Id": user},
-        method="POST",
+        method=method,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read())
+
+
+def upload_to_s3(upload, data, content_type):
+    boundary = uuid.uuid4().hex
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        for name, value in upload["fields"].items()
+    ]
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{upload["fileField"]}"; '
+        f'filename="upload"\r\nContent-Type: {content_type}\r\n\r\n'.encode() + data + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        upload["url"],
+        data=b"".join(parts),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request, timeout=60):
+        pass
+
+
+def seed_one(base_url, user, filename, tags, description):
+    registered = api(
+        base_url,
+        "POST",
+        "/images",
+        user,
+        {
+            "filename": filename,
+            "contentType": "image/png",
+            "sizeBytes": len(PNG_1X1),
+            "tags": tags,
+            "description": description,
+        },
+    )
+    upload_to_s3(registered["upload"], PNG_1X1, "image/png")
+    image_id = registered["image"]["imageId"]
+    for _ in range(60):
+        image = api(base_url, "GET", f"/images/{image_id}", user)
+        if image["status"] != "pending":
+            return image
+        time.sleep(1)
+    return image
 
 
 def main():
@@ -71,11 +110,13 @@ def main():
 
     for user, filename, tags, description in SAMPLES:
         try:
-            created = post_image(base_url, user, filename, tags, description)
+            image = seed_one(base_url, user, filename, tags, description)
         except urllib.error.HTTPError as exc:
             print(f"  FAILED {filename} for {user}: {exc.code} {exc.read()}")
             return 1
-        print("  {:<8} {:<20} {}".format(user, filename, created["imageId"]))
+        print(f"  {user:<8} {filename:<20} {image['imageId']}  {image['status']}")
+        if image["status"] != "ready":
+            return 1
 
     print(f"done: {len(SAMPLES)} images")
     return 0

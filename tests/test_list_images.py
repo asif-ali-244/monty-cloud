@@ -9,7 +9,12 @@ from tests.conftest import api_event, body_of
 
 @pytest.fixture
 def catalogue(aws):
-    """A small, deterministic corpus written straight to DynamoDB."""
+    """A small, deterministic corpus written straight to DynamoDB.
+
+    Five ready images, plus a pending and a rejected one that match every filter
+    below and must never be listed. They are written the way the service writes
+    them: without uploadedAt, which keeps them out of the sparse user index.
+    """
     table = aws.resource("dynamodb", region_name="us-east-1").Table(config.table_name())
     #    id       user     filename     contentType   tags                uploadedAt
     rows = [
@@ -30,8 +35,27 @@ def catalogue(aws):
                 "contentType": content_type,
                 "tags": tags,
                 "sizeBytes": 100,
+                "status": "ready",
+                "createdAt": uploaded_at,
                 "uploadedAt": uploaded_at,
                 "s3Key": f"images/{user}/{image_id}",
+                "s3Bucket": config.bucket_name(),
+            }
+        )
+    for image_id, status in (("img-pending", "pending"), ("img-rejected", "rejected")):
+        table.put_item(
+            Item={
+                "imageId": image_id,
+                "userId": "alice",
+                "filename": "beach-unfinished.png",
+                "filenameLower": "beach-unfinished.png",
+                "contentType": "image/png",
+                "tags": ["beach", "pets"],
+                "sizeBytes": 100,
+                "status": status,
+                "createdAt": "2024-02-10T10:00:00.000Z",
+                "expiresAt": 4102444800,
+                "s3Key": f"images/alice/{image_id}",
                 "s3Bucket": config.bucket_name(),
             }
         )
@@ -292,3 +316,45 @@ def test_a_filtered_page_can_be_empty_while_matches_remain(catalogue, context):
 
 def ids_of(body):
     return [item["imageId"] for item in body["items"]]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {},
+        {"userId": "alice"},
+        {"tag": "beach"},
+        {"userId": "alice", "tag": "pets"},
+        {"filename": "unfinished"},
+        {"uploadedFrom": "2024-01-01T00:00:00Z"},
+    ],
+)
+def test_pending_and_rejected_images_are_never_listed(catalogue, context, query):
+    listed = ids(list_images.handler(api_event("GET", query=query), context))
+    assert "img-pending" not in listed
+    assert "img-rejected" not in listed
+
+
+def test_listed_items_are_all_ready(catalogue, context):
+    body = body_of(list_images.handler(api_event("GET"), context))
+    assert {item["status"] for item in body["items"]} == {"ready"}
+
+
+def test_an_image_appears_in_listings_only_once_its_upload_is_verified(
+    aws, context, upload_payload
+):
+    """End to end through the real handlers, not hand-written rows."""
+    from tests.conftest import PNG_BYTES, client_upload, process, register
+
+    registered = register(context, upload_payload(), user_id="carol")
+    image_id = registered["image"]["imageId"]
+    by_user = api_event("GET", query={"userId": "carol"})
+    everyone = api_event("GET")
+
+    assert ids(list_images.handler(by_user, context)) == []
+    assert ids(list_images.handler(everyone, context)) == []
+
+    process(context, client_upload(registered, PNG_BYTES))
+
+    assert ids(list_images.handler(by_user, context)) == [image_id]
+    assert ids(list_images.handler(everyone, context)) == [image_id]

@@ -12,6 +12,11 @@ That pattern is a Query, so it stays O(results) no matter how large the table
 grows, and the ISO-8601 sort key makes the date filter a key condition rather
 than a post-filter.
 
+The GSI is also sparse, and deliberately so. ``uploadedAt`` is written only
+when an upload is verified, so pending and rejected rows are simply absent from
+the index: the indexed listing never sees them and needs no status filter. The
+Scan fallback has no index to lean on and filters on ``status`` explicitly.
+
 Filters that are not part of a key (tag, contentType) are applied as
 FilterExpressions. They are evaluated after the read, so they reduce payload
 but not consumed capacity - an accepted trade at this scale, and the reason
@@ -26,6 +31,10 @@ from botocore.exceptions import ClientError
 
 from src.common import config
 from src.common.errors import ConflictError, StorageError, ValidationError
+
+STATUS_PENDING = "pending"
+STATUS_READY = "ready"
+STATUS_REJECTED = "rejected"
 
 
 def put_new(item):
@@ -64,6 +73,63 @@ def delete(image_id):
     return result.get("Attributes")
 
 
+def mark_ready(image_id, s3_key, size_bytes, checksum, uploaded_at):
+    """Promote a pending upload to ready. Returns the new item, or None if it was not pending.
+
+    The condition makes this safe against every race the async flow allows: a
+    duplicate S3 event (already ready), an image deleted while its upload was in
+    flight (row gone), or an object that does not belong to this row (key
+    mismatch). In each case nothing is written and the caller decides what to do.
+
+    Writing ``uploadedAt`` is what adds the row to the sparse user index, and
+    removing ``expiresAt`` takes it out of TTL expiry.
+    """
+    return _transition(
+        image_id,
+        s3_key,
+        "SET #status = :to, sizeBytes = :size, checksumSha256 = :checksum, "
+        "uploadedAt = :uploadedAt REMOVE expiresAt",
+        {
+            ":to": STATUS_READY,
+            ":size": size_bytes,
+            ":checksum": checksum,
+            ":uploadedAt": uploaded_at,
+        },
+    )
+
+
+def mark_rejected(image_id, s3_key, reason, expires_at):
+    """Record why a pending upload was refused. Returns the new item, or None if not pending.
+
+    The row is kept, with a short TTL, so a client polling GET /images/{id} can
+    read the reason instead of watching the image silently vanish.
+    """
+    return _transition(
+        image_id,
+        s3_key,
+        "SET #status = :to, rejectionReason = :reason, expiresAt = :expiresAt",
+        {":to": STATUS_REJECTED, ":reason": reason, ":expiresAt": expires_at},
+    )
+
+
+def _transition(image_id, s3_key, update_expression, values):
+    try:
+        result = config.dynamodb_table().update_item(
+            Key={"imageId": image_id},
+            UpdateExpression=update_expression,
+            ConditionExpression="#status = :pending AND s3Key = :key",
+            # `status` is a DynamoDB reserved word.
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={**values, ":pending": STATUS_PENDING, ":key": s3_key},
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise StorageError("Could not update image metadata") from exc
+    return result.get("Attributes")
+
+
 def list_images(
     user_id=None,
     tag=None,
@@ -97,14 +163,13 @@ def list_images(
         else:
             # No partition key to anchor on. Bounded Scan with the date range
             # pushed down as a filter; see the module docstring for why this is
-            # the deliberate fallback and not the primary path.
-            date_filter = _date_filter(uploaded_from, uploaded_to)
-            if date_filter is not None:
-                params["FilterExpression"] = (
-                    date_filter
-                    if filter_expression is None
-                    else filter_expression & date_filter
-                )
+            # the deliberate fallback and not the primary path. Unlike the sparse
+            # index, the base table holds pending and rejected rows too.
+            scan_filter = Attr("status").eq(STATUS_READY)
+            for clause in (filter_expression, _date_filter(uploaded_from, uploaded_to)):
+                if clause is not None:
+                    scan_filter = scan_filter & clause
+            params["FilterExpression"] = scan_filter
             result = config.dynamodb_table().scan(**params)
             scanned = True
     except ClientError as exc:

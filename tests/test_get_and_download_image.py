@@ -163,3 +163,41 @@ def test_signing_uses_the_public_endpoint_when_set(aws, context, stored_image, m
         context,
     )
     assert body_of(response)["downloadUrl"].startswith("http://localhost:4566")
+
+
+def test_pending_image_metadata_is_readable_for_polling(aws, context, pending_image):
+    image_id = pending_image["image"]["imageId"]
+    response = get_image.handler(api_event("GET", path_parameters=path(image_id)), context)
+    assert response["statusCode"] == 200
+    body = body_of(response)
+    assert body["status"] == "pending"
+    assert "expiresAt" not in body
+
+
+def test_downloading_a_pending_image_is_409(aws, context, pending_image):
+    response = download_image.handler(
+        api_event("GET", path_parameters=path(pending_image["image"]["imageId"])), context
+    )
+    assert response["statusCode"] == 409
+    body = body_of(response)
+    assert body["code"] == "ImageNotReady"
+    assert "has not finished uploading" in body["error"]
+
+
+def test_downloading_a_rejected_image_is_409_with_the_reason(aws, context, upload_payload):
+    from tests.conftest import PDF_BYTES, client_upload, process, register
+
+    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    process(context, client_upload(registered, PDF_BYTES))
+
+    response = download_image.handler(
+        api_event("GET", path_parameters=path(registered["image"]["imageId"])), context
+    )
+    assert response["statusCode"] == 409
+    assert "was rejected: File content does not match" in body_of(response)["error"]
+
+
+def test_ready_image_metadata_carries_verified_fields(aws, context, stored_image):
+    for field in ("uploadedAt", "checksumSha256", "sizeBytes", "createdAt"):
+        assert field in stored_image
+    assert stored_image["status"] == "ready"

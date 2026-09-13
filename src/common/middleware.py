@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 
-from src.common import responses
+from src.common import responses, validation
 from src.common.errors import AppError, ValidationError
 
 logging.basicConfig()
@@ -90,6 +90,8 @@ def caller_id(event, required=True):
     if not user_id:
         headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
         user_id = headers.get("x-user-id")
-    if not user_id and required:
-        raise ValidationError("Caller identity missing: supply the X-User-Id header")
-    return user_id
+    if not user_id:
+        if required:
+            raise ValidationError("Caller identity missing: supply the X-User-Id header")
+        return None
+    return validation.validate_user_id(user_id)

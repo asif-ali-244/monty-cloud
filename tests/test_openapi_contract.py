@@ -86,10 +86,14 @@ class TestSpecItself:
 
         upload = spec["paths"]["/images"]["post"]
         for example in upload["requestBody"]["content"]["application/json"]["examples"].values():
-            schema_validator("UploadRequest", example["value"])
+            schema_validator("RegisterImageRequest", example["value"])
 
         created = upload["responses"]["201"]["content"]["application/json"]["example"]
-        schema_validator("Image", created)
+        schema_validator("RegisterImageResponse", created)
+
+        fetched = spec["paths"]["/images/{imageId}"]["get"]["responses"]["200"]
+        for example in fetched["content"]["application/json"]["examples"].values():
+            schema_validator("Image", example["value"])
 
         listing = spec["paths"]["/images"]["get"]["responses"]["200"]
         for example in listing["content"]["application/json"]["examples"].values():
@@ -130,8 +134,21 @@ class TestDocumentedConstantsMatchTheCode:
         assert expires["maximum"] == download_image.MAX_URL_TTL_SECONDS
         assert expires["default"] == config.DEFAULT_URL_TTL_SECONDS
 
+    def test_register_request_fields_match_what_the_service_accepts(self, spec):
+        from src.services import image_service
+
+        documented = set(spec["components"]["schemas"]["RegisterImageRequest"]["properties"])
+        assert documented == set(image_service.REGISTER_FIELDS)
+
+    def test_image_status_enum(self, spec):
+        from src.services import metadata_repository as repo
+
+        documented = set(spec["components"]["schemas"]["ImageStatus"]["enum"])
+        assert documented == {repo.STATUS_PENDING, repo.STATUS_READY, repo.STATUS_REJECTED}
+
     def test_upload_field_limits(self, spec):
-        upload = spec["components"]["schemas"]["UploadRequest"]["properties"]
+        upload = spec["components"]["schemas"]["RegisterImageRequest"]["properties"]
+        assert upload["sizeBytes"]["maximum"] == config.DEFAULT_MAX_IMAGE_BYTES
         assert upload["filename"]["maxLength"] == validation.MAX_FILENAME_LENGTH
         assert upload["description"]["maxLength"] == validation.MAX_DESCRIPTION_LENGTH
         assert upload["tags"]["maxItems"] == validation.MAX_TAGS
@@ -139,21 +156,46 @@ class TestDocumentedConstantsMatchTheCode:
         assert upload["tags"]["items"]["pattern"] == validation._TAG_RE.pattern
 
     def test_documented_max_image_size_matches_the_default(self, spec):
-        assert config.DEFAULT_MAX_IMAGE_BYTES == 5 * 1024 * 1024
-        assert "5 MB" in spec["info"]["description"]
+        assert config.DEFAULT_MAX_IMAGE_BYTES == 20 * 1024 * 1024
+        assert "20 MB" in spec["info"]["description"]
+
+    def test_upload_form_lifetime_matches_the_default(self, spec):
+        example = spec["paths"]["/images"]["post"]["responses"]["201"]["content"][
+            "application/json"
+        ]["example"]
+        assert example["upload"]["expiresInSeconds"] == config.DEFAULT_UPLOAD_URL_TTL_SECONDS
 
 
 class TestRealResponsesMatchTheirDocumentedSchema:
-    def test_upload_201(self, aws, context, upload_payload, schema_validator):
+    def test_register_201(self, aws, context, upload_payload, schema_validator):
         response = upload_image.handler(api_event("POST", body=upload_payload()), context)
         assert response["statusCode"] == 201
-        schema_validator("Image", body_of(response))
+        schema_validator("RegisterImageResponse", body_of(response))
 
-    def test_upload_without_optional_fields(self, aws, context, upload_payload, schema_validator):
+    def test_register_without_optional_fields(
+        self, aws, context, upload_payload, schema_validator
+    ):
         payload = upload_payload()
         del payload["tags"], payload["description"]
         response = upload_image.handler(api_event("POST", body=payload), context)
-        schema_validator("Image", body_of(response))
+        schema_validator("RegisterImageResponse", body_of(response))
+
+    def test_pending_image(self, aws, context, pending_image, schema_validator):
+        from tests.conftest import fetch_image
+
+        schema_validator("Image", fetch_image(context, pending_image["image"]["imageId"]))
+
+    def test_ready_image(self, aws, context, stored_image, schema_validator):
+        schema_validator("Image", stored_image)
+
+    def test_rejected_image(self, aws, context, upload_payload, schema_validator):
+        from tests.conftest import PDF_BYTES, client_upload, fetch_image, process, register
+
+        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        process(context, client_upload(registered, PDF_BYTES))
+        image = fetch_image(context, registered["image"]["imageId"])
+        assert image["status"] == "rejected"
+        schema_validator("Image", image)
 
     def test_list_200(self, aws, context, stored_image, schema_validator):
         response = list_images.handler(api_event("GET"), context)
@@ -166,10 +208,10 @@ class TestRealResponsesMatchTheirDocumentedSchema:
         schema_validator("ImagePage", body)
 
     def test_list_200_with_a_cursor(self, aws, context, upload_payload, schema_validator):
+        from tests.conftest import PNG_BYTES, complete_upload
+
         for index in range(3):
-            upload_image.handler(
-                api_event("POST", body=upload_payload(filename=f"f{index}.png")), context
-            )
+            complete_upload(context, upload_payload(filename=f"f{index}.png"), PNG_BYTES)
         body = body_of(
             list_images.handler(
                 api_event("GET", query={"userId": "user-alice", "limit": "1"}), context
@@ -200,6 +242,8 @@ class TestRealResponsesMatchTheirDocumentedSchema:
         [
             ("missing_identity", 400),
             ("not_found", 404),
+            ("not_ready", 409),
+            ("too_large", 413),
             ("unsupported_type", 415),
         ],
     )
@@ -213,6 +257,18 @@ class TestRealResponsesMatchTheirDocumentedSchema:
         elif handler_call == "not_found":
             response = get_image.handler(
                 api_event("GET", path_parameters={"imageId": "missing"}), context
+            )
+        elif handler_call == "not_ready":
+            from tests.conftest import register
+
+            pending = register(context, upload_payload())
+            response = download_image.handler(
+                api_event("GET", path_parameters={"imageId": pending["image"]["imageId"]}),
+                context,
+            )
+        elif handler_call == "too_large":
+            response = upload_image.handler(
+                api_event("POST", body=upload_payload(sizeBytes=10**12)), context
             )
         else:
             response = upload_image.handler(

@@ -1,6 +1,14 @@
-"""Shared fixtures. Every test runs against moto, so no AWS account is needed."""
+"""Shared fixtures. Every test runs against moto, so no AWS account is needed.
+
+Moto signs presigned POST forms but does not enforce their policies, so unit
+tests simulate the client's direct-to-S3 upload with a plain put_object and then
+deliver the S3 event to the processor by hand. Policy enforcement itself is
+exercised against LocalStack by scripts/smoke_test.py.
+"""
 
 import base64
+import json
+import urllib.parse
 
 import boto3
 import pytest
@@ -11,16 +19,15 @@ BUCKET_NAME = "test-images-bucket"
 USER_INDEX = "userId-uploadedAt-index"
 REGION = "us-east-1"
 
-# A real 1x1 PNG: the service checks magic bytes, so placeholder data will not do.
-PNG_BASE64 = (
+# A real 1x1 PNG: the processor checks magic bytes, so placeholder data will not do.
+PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
     "hKmMIQAAAABJRU5ErkJggg=="
 )
-PNG_BYTES = base64.b64decode(PNG_BASE64)
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 32 + b"\xff\xd9"
-JPEG_BASE64 = base64.b64encode(JPEG_BYTES).decode()
 GIF_BYTES = b"GIF89a" + b"\x00" * 32
-GIF_BASE64 = base64.b64encode(GIF_BYTES).decode()
+WEBP_BYTES = b"RIFF" + b"\x00" * 4 + b"WEBP" + b"\x00" * 16
+PDF_BYTES = b"%PDF-1.7 definitely not an image"
 
 
 @pytest.fixture(autouse=True)
@@ -39,9 +46,14 @@ def aws_environment(monkeypatch):
         "IMAGES_USER_INDEX": USER_INDEX,
     }.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-    monkeypatch.delenv("S3_PUBLIC_ENDPOINT", raising=False)
-    monkeypatch.delenv("MAX_IMAGE_BYTES", raising=False)
+    for key in (
+        "AWS_ENDPOINT_URL",
+        "S3_PUBLIC_ENDPOINT",
+        "MAX_IMAGE_BYTES",
+        "UPLOAD_URL_TTL_SECONDS",
+        "DOWNLOAD_URL_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
     config.reset_clients()
     yield
     config.reset_clients()
@@ -87,8 +99,6 @@ def api_event(
     is_base64=False,
 ):
     """Build an API Gateway REST proxy event."""
-    import json
-
     request_headers = {"Content-Type": "application/json"}
     if user_id:
         request_headers["X-User-Id"] = user_id
@@ -102,6 +112,23 @@ def api_event(
         "requestContext": {"requestId": "test-request", "authorizer": None},
         "body": body if isinstance(body, str) or body is None else json.dumps(body),
         "isBase64Encoded": is_base64,
+    }
+
+
+def s3_event(*keys, event_name="ObjectCreated:Post", bucket=BUCKET_NAME):
+    """Build an S3 notification, URL-encoding keys the way S3 does."""
+    return {
+        "Records": [
+            {
+                "eventSource": "aws:s3",
+                "eventName": event_name,
+                "s3": {
+                    "bucket": {"name": bucket},
+                    "object": {"key": urllib.parse.quote_plus(key, safe="/")},
+                },
+            }
+            for key in keys
+        ]
     }
 
 
@@ -122,7 +149,7 @@ def upload_payload():
         payload = {
             "filename": "sunset.png",
             "contentType": "image/png",
-            "imageBase64": PNG_BASE64,
+            "sizeBytes": len(PNG_BYTES),
             "tags": ["beach", "sunset"],
             "description": "Golden hour",
         }
@@ -132,24 +159,70 @@ def upload_payload():
     return _build
 
 
-@pytest.fixture
-def stored_image(aws, context, upload_payload):
-    """Upload one image through the real handler and return its metadata."""
-    import json
+def body_of(response):
+    return json.loads(response["body"]) if response["body"] else None
 
+
+def register(context, payload, user_id="user-alice"):
+    """POST /images through the real handler; returns the {image, upload} body."""
     from src.handlers import upload_image
 
-    response = upload_image.handler(
-        api_event("POST", "/images", body=upload_payload()), context
-    )
+    response = upload_image.handler(api_event("POST", body=payload, user_id=user_id), context)
     assert response["statusCode"] == 201, response["body"]
-    return json.loads(response["body"])
+    return body_of(response)
 
 
-def body_of(response):
-    import json
+def client_upload(registered, data, content_type=None):
+    """Do what the client does with the form: put the bytes at the signed key.
 
-    return json.loads(response["body"]) if response["body"] else None
+    Moto does not enforce POST policies, so the content type is taken from the
+    signed fields unless a test deliberately overrides it to simulate an object
+    that reached the key some other way.
+    """
+    fields = registered["upload"]["fields"]
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=BUCKET_NAME,
+        Key=fields["key"],
+        Body=data,
+        ContentType=content_type or fields["Content-Type"],
+    )
+    return fields["key"]
+
+
+def process(context, *keys):
+    """Deliver S3 ObjectCreated events to the real processor handler."""
+    from src.handlers import process_upload
+
+    return process_upload.handler(s3_event(*keys), context)
+
+
+def fetch_image(context, image_id):
+    from src.handlers import get_image
+
+    event = api_event("GET", path_parameters={"imageId": image_id})
+    return body_of(get_image.handler(event, context))
+
+
+def complete_upload(context, payload, data, user_id="user-alice"):
+    """Register, upload and process: the whole happy path. Returns the final image."""
+    registered = register(context, payload, user_id=user_id)
+    key = client_upload(registered, data)
+    process(context, key)
+    return fetch_image(context, registered["image"]["imageId"])
+
+
+@pytest.fixture
+def pending_image(aws, context, upload_payload):
+    """Registered, but the client has not uploaded yet."""
+    return register(context, upload_payload())
+
+
+@pytest.fixture
+def stored_image(aws, context, upload_payload):
+    """A fully uploaded, verified, ready image."""
+    image = complete_upload(context, upload_payload(), PNG_BYTES)
+    assert image["status"] == "ready", image
+    return image
 
 
 def s3_keys():
@@ -159,3 +232,12 @@ def s3_keys():
         .list_objects_v2(Bucket=BUCKET_NAME)
         .get("Contents", [])
     ]
+
+
+def table_item(image_id):
+    return (
+        boto3.resource("dynamodb", region_name=REGION)
+        .Table(TABLE_NAME)
+        .get_item(Key={"imageId": image_id})
+        .get("Item")
+    )

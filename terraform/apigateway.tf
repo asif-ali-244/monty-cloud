@@ -2,13 +2,11 @@ resource "aws_api_gateway_rest_api" "images" {
   name        = "${local.name_prefix}-api"
   description = "Image upload and catalogue API"
 
+  # No binary_media_types: image bytes never pass through the API. Uploads go
+  # to S3 on a presigned POST and downloads redirect to a presigned GET.
   endpoint_configuration {
     types = ["REGIONAL"]
   }
-
-  # Images arrive as base64 inside JSON, so nothing here is genuinely binary;
-  # declaring the wildcard keeps API Gateway from re-encoding proxy responses.
-  binary_media_types = ["*/*"]
 }
 
 # /images
@@ -41,7 +39,7 @@ locals {
 }
 
 resource "aws_api_gateway_method" "function" {
-  for_each = local.functions
+  for_each = local.api_routes
 
   rest_api_id = aws_api_gateway_rest_api.images.id
   resource_id = local.api_resources[each.value.resource]
@@ -58,7 +56,7 @@ resource "aws_api_gateway_method" "function" {
 }
 
 resource "aws_api_gateway_integration" "function" {
-  for_each = local.functions
+  for_each = local.api_routes
 
   rest_api_id = aws_api_gateway_rest_api.images.id
   resource_id = local.api_resources[each.value.resource]
@@ -71,7 +69,7 @@ resource "aws_api_gateway_integration" "function" {
 }
 
 resource "aws_lambda_permission" "api_gateway" {
-  for_each = local.functions
+  for_each = local.api_routes
 
   statement_id  = "AllowInvokeFromApiGateway"
   action        = "lambda:InvokeFunction"

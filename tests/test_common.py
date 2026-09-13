@@ -9,12 +9,14 @@ from src.common import config, responses, validation
 from src.common.errors import (
     AppError,
     NotFoundError,
+    PayloadTooLargeError,
     UnsupportedMediaTypeError,
     ValidationError,
 )
 from src.common.middleware import api_handler, caller_id, parse_json_body, path_param
+from src.services import image_service
 from src.services import metadata_repository as repo
-from tests.conftest import PNG_BASE64, FakeContext, api_event
+from tests.conftest import GIF_BYTES, JPEG_BYTES, PNG_BYTES, WEBP_BYTES, FakeContext, api_event
 
 
 class TestTimestamps:
@@ -110,24 +112,106 @@ class TestTags:
             validation.normalise_tags(given)
 
 
-class TestImageDecoding:
-    def test_decodes_plain_base64(self):
-        assert validation.decode_image(PNG_BASE64, "image/png").startswith(b"\x89PNG")
+class TestSizeBytes:
+    @pytest.mark.parametrize("given", [1, 70, config.DEFAULT_MAX_IMAGE_BYTES])
+    def test_accepts_positive_integers_up_to_the_limit(self, given):
+        assert validation.parse_size_bytes(given) == given
 
-    def test_decodes_data_url(self):
-        payload = "data:image/png;base64," + PNG_BASE64
-        assert validation.decode_image(payload, "image/png").startswith(b"\x89PNG")
+    @pytest.mark.parametrize("given", ["70", 70.0, 70.5, True, False, [70], {"n": 70}])
+    def test_rejects_anything_that_is_not_a_json_integer(self, given):
+        """bool is an int subclass in Python; a JSON `true` must not pass as 1 byte."""
+        with pytest.raises(ValidationError, match="must be an integer"):
+            validation.parse_size_bytes(given)
 
-    def test_rejects_empty_file(self):
+    def test_missing_is_required_not_a_type_error(self):
+        with pytest.raises(ValidationError, match="is required"):
+            validation.parse_size_bytes(None)
+
+    @pytest.mark.parametrize("given", [0, -1])
+    def test_rejects_non_positive(self, given):
+        with pytest.raises(ValidationError, match="at least 1"):
+            validation.parse_size_bytes(given)
+
+    def test_over_the_limit_is_413_not_400(self):
+        with pytest.raises(PayloadTooLargeError):
+            validation.parse_size_bytes(config.DEFAULT_MAX_IMAGE_BYTES + 1)
+
+
+class TestSignatures:
+    @pytest.mark.parametrize(
+        "content_type,data",
+        [
+            ("image/png", PNG_BYTES),
+            ("image/jpeg", JPEG_BYTES),
+            ("image/gif", GIF_BYTES),
+            ("image/gif", b"GIF87a" + b"\x00" * 10),
+            ("image/webp", WEBP_BYTES),
+        ],
+    )
+    def test_accepts_matching_magic_bytes(self, content_type, data):
+        validation.verify_signature(data[: validation.SIGNATURE_PREFIX_BYTES], content_type)
+
+    @pytest.mark.parametrize(
+        "content_type,data",
+        [
+            ("image/png", JPEG_BYTES),
+            ("image/jpeg", PNG_BYTES),
+            ("image/gif", b"%PDF-1.7 not a gif"),
+            ("image/webp", b"RIFF\x00\x00\x00\x00WAVEfmt "),
+        ],
+    )
+    def test_rejects_mismatched_magic_bytes(self, content_type, data):
+        with pytest.raises(ValidationError, match="does not match"):
+            validation.verify_signature(data[: validation.SIGNATURE_PREFIX_BYTES], content_type)
+
+    def test_prefix_is_long_enough_for_every_signature(self):
+        """WEBP's marker sits at bytes 8-12, the deepest check."""
+        assert validation.SIGNATURE_PREFIX_BYTES >= 12
+
+
+class TestUserIds:
+    @pytest.mark.parametrize(
+        "given", ["alice", "user-42", "a.b_c@example.com", "0f8fad5b-d9cb-469f-a165-70867728950e"]
+    )
+    def test_accepts_usernames_emails_and_cognito_subs(self, given):
+        assert validation.validate_user_id(given) == given
+
+    @pytest.mark.parametrize(
+        "given", ["", None, 42, "a/b", "../x", "with space", "tab\there", "x" * 129, ".hidden"]
+    )
+    def test_rejects_anything_unsafe_in_an_s3_key(self, given):
         with pytest.raises(ValidationError):
-            validation.decode_image("", "image/png")
+            validation.validate_user_id(given)
 
-    def test_rejects_webp_without_the_webp_marker(self):
-        import base64
 
-        fake = base64.b64encode(b"RIFF" + b"\x00" * 4 + b"NOPE" + b"\x00" * 8).decode()
-        with pytest.raises(ValidationError):
-            validation.decode_image(fake, "image/webp")
+class TestUnknownFields:
+    def test_allows_the_documented_fields(self):
+        validation.reject_unknown_fields({"filename": "a", "tags": []}, ("filename", "tags"))
+
+    def test_names_every_unknown_field(self):
+        with pytest.raises(ValidationError, match="imageBase64, legacy"):
+            validation.reject_unknown_fields(
+                {"filename": "a", "legacy": 1, "imageBase64": "x"}, ("filename",)
+            )
+
+
+VALID_ID = "0123456789abcdef0123456789abcdef"
+
+
+class TestUploadKeys:
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            (f"images/alice/{VALID_ID}.png", VALID_ID),
+            (f"images/a.b@x.com/{VALID_ID}.webp", VALID_ID),
+            ("images/alice/0123456789ABCDEF0123456789ABCDEF.png", None),
+            ("images/alice/short.png", None),
+            ("uploads/alice/0123456789abcdef0123456789abcdef.png", None),
+            ("images/", None),
+        ],
+    )
+    def test_recovers_the_image_id_only_from_our_own_keys(self, key, expected):
+        assert image_service.image_id_from_key(key) == expected
 
 
 class TestPagination:
@@ -286,10 +370,14 @@ class TestDefensiveGuards:
         with pytest.raises(ValidationError):
             validation.parse_timestamp(12345, "uploadedFrom")
 
-    def test_empty_data_url_payload_is_rejected(self):
-        with pytest.raises(ValidationError) as excinfo:
-            validation.decode_image("data:image/png;base64,", "image/png")
-        assert "empty file" in str(excinfo.value)
+    def test_optional_identity_that_is_absent_returns_none(self):
+        assert caller_id(api_event(user_id=None), required=False) is None
+
+    def test_to_public_hides_expiry_and_storage_attributes(self):
+        public = image_service.to_public(
+            {"imageId": "x", "s3Key": "k", "s3Bucket": "b", "filenameLower": "f", "expiresAt": 1}
+        )
+        assert public == {"imageId": "x"}
 
     def test_encoder_still_raises_on_genuinely_unserialisable_values(self):
         with pytest.raises(TypeError):

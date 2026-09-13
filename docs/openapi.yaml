@@ -2,12 +2,35 @@ openapi: 3.0.3
 
 info:
   title: Image Service API
-  version: 1.0.0
+  version: 2.0.0
   description: |
     Upload, catalogue, retrieve and delete images.
 
     Image bytes are stored in S3 and their metadata in DynamoDB. Each endpoint is
     backed by its own Lambda function behind API Gateway.
+
+    ## Uploading
+
+    Image bytes never pass through this API. An upload takes three steps:
+
+    1. `POST /images` with the metadata and the file's size. The response holds
+       the image record (status `pending`) and a presigned S3 POST form.
+    2. POST the file straight to S3 as `multipart/form-data`: every entry of
+       `upload.fields` as a form field, then the file as the `upload.fileField`
+       field, last. S3 enforces the signed policy - exact key, exact
+       Content-Type, and a body of exactly `sizeBytes` - and refuses anything
+       else with `400` or `403` before storing a byte.
+    3. S3 notifies an upload processor, which checks the file's magic bytes
+       against `contentType`, hashes it, and moves the image to `ready` (usually
+       within a couple of seconds) or `rejected` with a `rejectionReason`. Poll
+       `GET /images/{imageId}` to see the outcome.
+
+    Only `ready` images are listed or downloadable. A `pending` image whose file
+    never arrives expires automatically.
+
+    Because the bytes bypass API Gateway and Lambda, uploads are not bound by
+    their payload limits (10 MB and 6 MB). The size ceiling is a product limit,
+    20 MB by default (`MAX_IMAGE_BYTES`), and is enforced by S3 itself.
 
     ## Identity
 
@@ -17,18 +40,11 @@ info:
     `requestContext.authorizer.claims.sub` over the header, so no application
     change is needed when one is attached.
 
-    ## Sizes
-
-    An upload carries the image as base64 inside the JSON body. Base64 inflates
-    a payload by roughly a third and API Gateway caps a proxy request at 10 MB,
-    so the decoded image must be at most 5 MB (`MAX_IMAGE_BYTES`). Downloads are
-    not bound by that limit: they redirect to a presigned S3 URL and the bytes
-    never pass through Lambda.
-
     ## Errors
 
-    Every failure returns the same body shape - a human-readable `error` and a
-    stable machine-readable `code` - with an appropriate HTTP status.
+    Every API failure returns the same body shape - a human-readable `error` and
+    a stable machine-readable `code` - with an appropriate HTTP status. Failures
+    on the direct S3 upload are S3's own XML error responses.
   contact:
     name: monty-cloud image service
   license:
@@ -39,8 +55,8 @@ servers:
     description: LocalStack
     variables:
       restApiId:
-        default: fqiybc3p1p
-        description: From `terraform -chdir=terraform output -raw rest_api_id`.
+        default: pcd01ggzi3
+        description: Changes on every fresh deploy - take it from `terraform -chdir=terraform output -raw rest_api_id`.
       stage:
         default: local
   - url: https://{restApiId}.execute-api.{region}.amazonaws.com/{stage}
@@ -64,20 +80,21 @@ paths:
   /images:
     post:
       tags: [Images]
-      summary: Upload an image with its metadata
-      operationId: uploadImage
+      summary: Register an image and get a direct-to-S3 upload form
+      operationId: registerImage
       description: |
-        Stores the image in S3 and its metadata in DynamoDB, and returns the
-        created record.
+        Records the image's metadata with status `pending` and returns a
+        presigned S3 POST form for the file itself. See **Uploading** above for
+        the full flow.
 
-        The declared `contentType` is verified against the file's magic bytes, so
-        a non-image renamed to `.png` is rejected rather than stored.
+        No bytes are sent in this request. `sizeBytes` is required because it is
+        signed into the upload policy as an exact content-length, so S3 refuses a
+        body of any other size and the recorded size can be trusted. Declaring
+        more than the size limit fails here with `413`, before any upload is
+        attempted.
 
-        The object is written before the metadata row. An interruption between
-        the two therefore leaves an unreferenced object - invisible to every
-        endpoint - rather than a metadata row pointing at bytes that do not
-        exist. The upload also issues a compensating delete when the metadata
-        write fails.
+        Unknown body fields are rejected rather than ignored - in particular
+        `imageBase64`, which earlier versions of this API accepted.
       security:
         - UserIdHeader: []
       requestBody:
@@ -85,34 +102,28 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UploadRequest'
+              $ref: '#/components/schemas/RegisterImageRequest'
             examples:
               minimal:
                 summary: Only the required fields
                 value:
                   filename: sunset.png
                   contentType: image/png
-                  imageBase64: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+                  sizeBytes: 70
               full:
                 summary: With tags and a description
                 value:
                   filename: sunset.png
                   contentType: image/png
-                  imageBase64: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+                  sizeBytes: 70
                   tags: [beach, sunset]
                   description: Golden hour
-              dataUrl:
-                summary: Browser data-URL form, accepted as-is
-                value:
-                  filename: sunset.png
-                  contentType: image/png
-                  imageBase64: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
       responses:
         '201':
-          description: Created.
+          description: Registered. Upload the file with the returned form.
           headers:
             Location:
-              description: Path of the created image.
+              description: Path of the image; poll it for the upload outcome.
               schema:
                 type: string
                 example: /images/334d3b476eba4fbfa2b00e2aa4792a8a
@@ -121,17 +132,33 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Image'
+                $ref: '#/components/schemas/RegisterImageResponse'
               example:
-                imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
-                userId: alice
-                filename: sunset.png
-                contentType: image/png
-                sizeBytes: 70
-                checksumSha256: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
-                tags: [beach, sunset]
-                description: Golden hour
-                uploadedAt: '2026-09-12T00:43:34.500Z'
+                image:
+                  imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
+                  userId: alice
+                  filename: sunset.png
+                  contentType: image/png
+                  sizeBytes: 70
+                  tags: [beach, sunset]
+                  description: Golden hour
+                  status: pending
+                  createdAt: '2026-09-13T10:15:02.118Z'
+                upload:
+                  method: POST
+                  url: http://localhost:4566/monty-images-local-bucket
+                  fileField: file
+                  fields:
+                    Content-Type: image/png
+                    key: images/alice/334d3b476eba4fbfa2b00e2aa4792a8a.png
+                    x-amz-algorithm: AWS4-HMAC-SHA256
+                    x-amz-credential: ASIAEXAMPLE/20260913/us-east-1/s3/aws4_request
+                    x-amz-date: 20260913T101502Z
+                    x-amz-security-token: IQoJb3JpZ2luX2VjEXAMPLE
+                    policy: eyJleHBpcmF0aW9uIjogIjIwMjYtMDktMTNUMTA6MzA6MDJaIiwgImNvbmRpdGlvbnMiOiBbXX0=
+                    x-amz-signature: 5f1c1b3f9d0a7e4c2b6a8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c
+                  expiresAt: '2026-09-13T10:30:02.118Z'
+                  expiresInSeconds: 900
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
@@ -150,7 +177,8 @@ paths:
       summary: List and search images
       operationId: listImages
       description: |
-        Returns a page of images, newest first, with cursor pagination.
+        Returns a page of `ready` images, newest first, with cursor pagination.
+        Pending and rejected images are never listed.
 
         Stop paging when `nextToken` is `null`, never when a page is empty:
         `limit` bounds the rows read rather than the rows returned, so a page
@@ -188,7 +216,7 @@ paths:
                   summary: First page of two
                   value:
                     items:
-                      - imageId: 1855ff4111214a2eb41276f75f431327
+                      - imageId: 0c758007aa834ae2a97f49b39d35039e
                         userId: carol
                         filename: surfboard.png
                         contentType: image/png
@@ -196,9 +224,11 @@ paths:
                         checksumSha256: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
                         tags: [beach, sports]
                         description: Board waxed and ready
-                        uploadedAt: '2026-09-12T00:43:34.649Z'
+                        status: ready
+                        createdAt: '2026-09-13T10:15:07.402Z'
+                        uploadedAt: '2026-09-13T10:15:08.960Z'
                     count: 1
-                    nextToken: eyJpbWFnZUlkIjogIjE4NTVmZjQxMTEyMTRhMmViNDEyNzZmNzVmNDMxMzI3In0=
+                    nextToken: eyJpbWFnZUlkIjogIjBjNzU4MDA3YWE4MzRhZTJhOTdmNDliMzlkMzUwMzllIn0=
                 lastPage:
                   summary: Last page - nextToken is null
                   value:
@@ -231,7 +261,10 @@ paths:
       tags: [Images]
       summary: View one image's metadata
       operationId: getImage
-      description: Returns the metadata record. Storage-internal attributes are never exposed.
+      description: |
+        Returns the metadata record in any state. This is how a client learns the
+        outcome of an upload: poll until `status` leaves `pending`. Storage-internal
+        attributes are never exposed.
       security: []
       responses:
         '200':
@@ -243,6 +276,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Image'
+              examples:
+                pending:
+                  summary: Registered, file not yet verified
+                  value:
+                    imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
+                    userId: alice
+                    filename: sunset.png
+                    contentType: image/png
+                    sizeBytes: 70
+                    tags: [beach, sunset]
+                    status: pending
+                    createdAt: '2026-09-13T10:15:02.118Z'
+                ready:
+                  summary: Upload verified
+                  value:
+                    imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
+                    userId: alice
+                    filename: sunset.png
+                    contentType: image/png
+                    sizeBytes: 70
+                    checksumSha256: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
+                    tags: [beach, sunset]
+                    status: ready
+                    createdAt: '2026-09-13T10:15:02.118Z'
+                    uploadedAt: '2026-09-13T10:15:03.874Z'
+                rejected:
+                  summary: Upload refused by the processor
+                  value:
+                    imageId: 334d3b476eba4fbfa2b00e2aa4792a8a
+                    userId: alice
+                    filename: not-really.png
+                    contentType: image/png
+                    sizeBytes: 35
+                    tags: []
+                    status: rejected
+                    rejectionReason: "File content does not match the declared contentType 'image/png'"
+                    createdAt: '2026-09-13T10:15:02.118Z'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -257,16 +327,17 @@ paths:
       summary: Delete an image
       operationId: deleteImage
       description: |
-        Removes the metadata row and then the stored object.
+        Removes the metadata row and then the stored object, in any state. A
+        pending image may have no object yet; that is fine.
 
         Deleting an image that is already gone returns `404`, not `204`. A client
         that deletes the wrong id should hear about it rather than be told the
         call succeeded.
 
         The metadata row is removed first because it is the source of truth for
-        whether an image exists. If the S3 delete then fails, the object is
-        orphaned and logged for reconciliation - preferable to a live metadata
-        row whose bytes have already been removed.
+        whether an image exists. If a file for a deleted image is uploaded
+        afterwards, the processor finds no row and deletes the object, so a late
+        upload cannot bring the image back.
       security:
         - UserIdHeader: []
       responses:
@@ -303,12 +374,14 @@ paths:
       operationId: downloadImage
       description: |
         Redirects to a short-lived presigned S3 URL, so the image bytes never
-        pass through Lambda or API Gateway - no 6 MB response cap, no compute
+        pass through Lambda or API Gateway - no response payload cap, no compute
         time proportional to file size, and no double-billed transfer.
 
         The presigned URL carries a signed `Content-Type` and
         `Content-Disposition`, so the browser renders or saves the file under its
         original name.
+
+        Only `ready` images have content. A pending or rejected image is a `409`.
 
         Clients that cannot follow redirects should pass `redirect=false` to get
         the URL as JSON instead.
@@ -343,6 +416,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ImageNotReady'
         '500':
           $ref: '#/components/responses/InternalError'
         '502':
@@ -356,8 +431,10 @@ components:
       name: X-User-Id
       description: |
         Development stand-in for an authenticated identity. Required on `POST
-        /images` and `DELETE /images/{imageId}`. In a deployed environment an
-        API Gateway authorizer replaces it and the header is ignored.
+        /images` and `DELETE /images/{imageId}`. 1-128 characters of letters,
+        digits, `.`, `_`, `@` or `-`, starting with a letter or digit - the value
+        becomes part of the S3 object key. In a deployed environment an API
+        Gateway authorizer replaces it and the header is ignored.
 
   headers:
     AccessControlAllowOrigin:
@@ -420,7 +497,7 @@ components:
       name: uploadedFrom
       in: query
       required: false
-      description: Inclusive lower bound, ISO-8601. Naive timestamps are read as UTC.
+      description: Inclusive lower bound on `uploadedAt`, ISO-8601. Naive timestamps are read as UTC.
       schema:
         type: string
         format: date-time
@@ -430,7 +507,7 @@ components:
       name: uploadedTo
       in: query
       required: false
-      description: Inclusive upper bound, ISO-8601.
+      description: Inclusive upper bound on `uploadedAt`, ISO-8601.
       schema:
         type: string
         format: date-time
@@ -502,9 +579,20 @@ components:
         - image/gif
         - image/webp
 
-    UploadRequest:
+    ImageStatus:
+      type: string
+      description: |
+        `pending` - registered, file not yet verified. `ready` - verified,
+        listed and downloadable. `rejected` - the uploaded file failed
+        verification; see `rejectionReason`.
+      enum:
+        - pending
+        - ready
+        - rejected
+
+    RegisterImageRequest:
       type: object
-      required: [filename, contentType, imageBase64]
+      required: [filename, contentType, sizeBytes]
       additionalProperties: false
       properties:
         filename:
@@ -518,13 +606,15 @@ components:
           example: sunset.png
         contentType:
           $ref: '#/components/schemas/ContentType'
-        imageBase64:
-          type: string
+        sizeBytes:
+          type: integer
+          minimum: 1
+          maximum: 20971520
           description: |
-            Base64-encoded image, or a `data:<type>;base64,<payload>` URL. Must
-            decode to at most 5 MB and must begin with magic bytes matching
-            `contentType`.
-          example: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+            Exact size of the file that will be uploaded, as a JSON integer (not a
+            string, float or boolean). Signed into the upload policy, so S3
+            refuses a body of any other size.
+          example: 70
         tags:
           type: array
           maxItems: 20
@@ -541,20 +631,81 @@ components:
           maxLength: 1024
           example: Golden hour
 
+    RegisterImageResponse:
+      type: object
+      required: [image, upload]
+      properties:
+        image:
+          $ref: '#/components/schemas/Image'
+        upload:
+          $ref: '#/components/schemas/UploadForm'
+
+    UploadForm:
+      type: object
+      description: |
+        A presigned S3 POST. Send `multipart/form-data` to `url` with every entry
+        of `fields` as a form field, followed by the file as the `fileField`
+        field - S3 requires the file to be the last field. The set of `fields`
+        varies with the credentials that signed it (for example
+        `x-amz-security-token` appears only for temporary credentials), so copy
+        them all rather than naming them.
+      required: [method, url, fields, fileField, expiresAt, expiresInSeconds]
+      properties:
+        method:
+          type: string
+          enum: [POST]
+        url:
+          type: string
+          format: uri
+          description: The bucket endpoint to POST to.
+          example: http://localhost:4566/monty-images-local-bucket
+        fields:
+          type: object
+          description: Signed form fields, to be sent unchanged. Changing any of them invalidates the signature.
+          required: [key, Content-Type, policy]
+          additionalProperties:
+            type: string
+          properties:
+            key:
+              type: string
+              example: images/alice/334d3b476eba4fbfa2b00e2aa4792a8a.png
+            Content-Type:
+              type: string
+              example: image/png
+            policy:
+              type: string
+              description: Base64 JSON policy fixing the key, Content-Type and exact content length.
+        fileField:
+          type: string
+          description: Name of the form field that must carry the file.
+          example: file
+        expiresAt:
+          type: string
+          format: date-time
+          description: The form cannot be used after this instant.
+          example: '2026-09-13T10:30:02.118Z'
+        expiresInSeconds:
+          type: integer
+          example: 900
+
     Image:
       type: object
       description: |
-        An image metadata record. `s3Key` and `s3Bucket` exist on the stored item
-        but are stripped from every response.
+        An image metadata record. Storage attributes (`s3Key`, `s3Bucket`) and the
+        expiry timestamp exist on the stored item but are stripped from every
+        response.
+
+        `checksumSha256` and `uploadedAt` are present only once the image is
+        `ready`; `rejectionReason` only when it is `rejected`.
       required:
         - imageId
         - userId
         - filename
         - contentType
         - sizeBytes
-        - checksumSha256
         - tags
-        - uploadedAt
+        - status
+        - createdAt
       properties:
         imageId:
           type: string
@@ -572,12 +723,12 @@ components:
           $ref: '#/components/schemas/ContentType'
         sizeBytes:
           type: integer
-          description: Size of the decoded image.
+          description: Declared at registration, and verified against the stored object once ready.
           example: 70
         checksumSha256:
           type: string
           pattern: '^[0-9a-f]{64}$'
-          description: SHA-256 of the stored bytes; lets a client verify a download.
+          description: SHA-256 of the stored bytes, computed by the processor. Ready images only.
           example: c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77
         tags:
           type: array
@@ -586,16 +737,28 @@ components:
           example: [beach, sunset]
         description:
           type: string
-          description: Present only when supplied at upload.
+          description: Present only when supplied at registration.
           example: Golden hour
+        status:
+          $ref: '#/components/schemas/ImageStatus'
+        rejectionReason:
+          type: string
+          description: Why verification failed. Rejected images only.
+          example: "File content does not match the declared contentType 'image/png'"
+        createdAt:
+          type: string
+          format: date-time
+          description: When the image was registered.
+          example: '2026-09-13T10:15:02.118Z'
         uploadedAt:
           type: string
           format: date-time
           description: |
-            UTC, millisecond precision, always `Z`-suffixed. This canonical form
-            sorts lexicographically, which is what allows it to serve as the GSI
-            sort key and to support range filters.
-          example: '2026-09-12T00:43:34.500Z'
+            When the upload was verified. Ready images only. UTC, millisecond
+            precision, always `Z`-suffixed; this canonical form sorts
+            lexicographically, which is what lets it serve as the GSI sort key
+            and support range filters.
+          example: '2026-09-13T10:15:03.874Z'
 
     ImagePage:
       type: object
@@ -647,6 +810,7 @@ components:
             - ValidationError
             - NotFound
             - Conflict
+            - ImageNotReady
             - PayloadTooLarge
             - UnsupportedMediaType
             - StorageError
@@ -669,8 +833,9 @@ components:
 
     BadRequest:
       description: |
-        The request failed validation: a malformed or missing body field, an
-        unparseable filter, a bad `nextToken`, or a missing caller identity.
+        The request failed validation: a malformed, missing, mistyped or unknown
+        body field, an unparseable filter, a bad `nextToken`, or a missing or
+        malformed caller identity.
       content:
         application/json:
           schema:
@@ -678,12 +843,17 @@ components:
           examples:
             missingField:
               value:
-                error: "'filename' is required"
+                error: "'sizeBytes' is required"
                 code: ValidationError
-            contentMismatch:
-              summary: Declared type contradicts the file's magic bytes
+            wrongType:
+              summary: sizeBytes sent as a string
               value:
-                error: "File content does not match the declared contentType 'image/png'"
+                error: "'sizeBytes' must be an integer"
+                code: ValidationError
+            unknownField:
+              summary: The retired base64 upload field
+              value:
+                error: 'Unknown field(s): imageBase64. Allowed: contentType, description, filename, sizeBytes, tags'
                 code: ValidationError
             badToken:
               value:
@@ -714,14 +884,30 @@ components:
             error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' already exists"
             code: Conflict
 
+    ImageNotReady:
+      description: The image is pending or was rejected, so it has no content to serve.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            pending:
+              value:
+                error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' has not finished uploading"
+                code: ImageNotReady
+            rejected:
+              value:
+                error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' was rejected: File content does not match the declared contentType 'image/png'"
+                code: ImageNotReady
+
     PayloadTooLarge:
-      description: The decoded image exceeds `MAX_IMAGE_BYTES`.
+      description: The declared `sizeBytes` exceeds `MAX_IMAGE_BYTES`.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           example:
-            error: Image is 8388608 bytes; the limit is 5242880 bytes
+            error: Image is 26214400 bytes; the limit is 20971520 bytes
             code: PayloadTooLarge
 
     UnsupportedMediaType:

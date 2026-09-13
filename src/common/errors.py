@@ -36,6 +36,13 @@ class ConflictError(AppError):
     code = "Conflict"
 
 
+class ImageNotReadyError(AppError):
+    """Image upload has not completed."""
+
+    status_code = 409
+    code = "ImageNotReady"
+
+
 class PayloadTooLargeError(AppError):
     """Image exceeds the maximum accepted size."""
 

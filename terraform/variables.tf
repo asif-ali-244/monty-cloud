@@ -40,7 +40,7 @@ variable "lambda_internal_endpoint" {
 }
 
 variable "s3_public_endpoint" {
-  description = "Endpoint used to sign download URLs, as reached from the caller's browser."
+  description = "Endpoint used to sign upload and download URLs, as reached from the caller's browser."
   type        = string
   default     = "http://localhost:4566"
 }
@@ -64,9 +64,15 @@ variable "log_retention_days" {
 }
 
 variable "max_image_bytes" {
-  description = "Largest accepted image. API Gateway caps a proxy request at 10 MB, and base64 inflates by ~33%."
+  description = "Largest accepted image. Enforced by the upload policy in S3; no API or Lambda payload limit applies."
   type        = number
-  default     = 5242880
+  default     = 20971520
+}
+
+variable "upload_url_ttl_seconds" {
+  description = "Lifetime of a presigned upload form."
+  type        = number
+  default     = 900
 }
 
 variable "download_url_ttl_seconds" {

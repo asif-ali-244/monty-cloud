@@ -10,10 +10,20 @@ import os
 import boto3
 from botocore.config import Config as BotoConfig
 
-DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# Bytes go straight to S3, so this is a product limit rather than a transport
+# one: the Lambda 6 MB invoke payload cap no longer applies to uploads.
+DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
 DEFAULT_URL_TTL_SECONDS = 900
+DEFAULT_UPLOAD_URL_TTL_SECONDS = 900
+# A pending row outlives its upload form by this much, so an upload that starts
+# just before the form expires still has time to be processed.
+PENDING_GRACE_SECONDS = 3600
+# Rejected rows stay readable long enough for a client polling for the outcome.
+REJECTED_RETENTION_SECONDS = 24 * 3600
+
+UPLOAD_KEY_PREFIX = "images/"
 
 ALLOWED_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
@@ -73,13 +83,17 @@ def url_ttl_seconds():
     return int(_env("DOWNLOAD_URL_TTL_SECONDS", DEFAULT_URL_TTL_SECONDS))
 
 
+def upload_url_ttl_seconds():
+    return int(_env("UPLOAD_URL_TTL_SECONDS", DEFAULT_UPLOAD_URL_TTL_SECONDS))
+
+
 def endpoint_url():
     """LocalStack endpoint; unset (None) means real AWS."""
     return _env("AWS_ENDPOINT_URL")
 
 
 def s3_public_endpoint():
-    """Endpoint used to sign download URLs when it differs from the internal one.
+    """Endpoint used to sign upload and download URLs when it differs from the internal one.
 
     Inside LocalStack the Lambda container reaches S3 on a hostname the caller's
     browser cannot resolve, so the signing endpoint has to be overridable.

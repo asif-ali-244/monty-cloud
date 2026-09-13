@@ -1,11 +1,10 @@
 """Input validation and normalisation.
 
-All of it runs before a single AWS call is made, so a malformed request costs
-one Lambda invocation and nothing downstream.
+Request validation runs before a single AWS call is made, so a malformed request
+costs one Lambda invocation and nothing downstream. Content validation (magic
+bytes) runs later, in the upload processor, because the bytes never reach the API.
 """
 
-import base64
-import binascii
 import datetime as dt
 import os
 import re
@@ -21,7 +20,11 @@ MAX_FILENAME_LENGTH = 255
 MAX_TAGS = 20
 MAX_TAG_LENGTH = 50
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_USER_ID_LENGTH = 128
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# The user id becomes an S3 key segment, so it must not be able to introduce a
+# '/' (a new prefix) or characters that S3 event notifications URL-encode.
+USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 _ISO_SUFFIX = "+00:00"
 
 # Magic bytes, checked so that a caller cannot label an executable as image/png.
@@ -31,6 +34,24 @@ _SIGNATURES = {
     "image/gif": [b"GIF87a", b"GIF89a"],
     "image/webp": [b"RIFF"],
 }
+# Enough leading bytes to decide every signature above, including WEBP's
+# marker at offset 8.
+SIGNATURE_PREFIX_BYTES = 12
+
+
+def reject_unknown_fields(payload, allowed):
+    """Refuse fields the contract does not define instead of silently ignoring them.
+
+    A client that still sends the retired ``imageBase64`` should hear that the
+    bytes were not accepted, not get a 201 for an image that will never arrive.
+    """
+    unknown = sorted(set(payload) - set(allowed))
+    if unknown:
+        raise ValidationError(
+            "Unknown field(s): {}. Allowed: {}".format(
+                ", ".join(unknown), ", ".join(sorted(allowed))
+            )
+        )
 
 
 def require_string(payload, field, max_length=None, required=True, default=None):
@@ -74,38 +95,46 @@ def validate_content_type(value):
     return normalised
 
 
-def decode_image(raw, content_type):
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValidationError("'imageBase64' is required")
-    payload = raw.strip()
-    if payload.startswith("data:"):
-        # Accept the data-URL form browsers produce: data:image/png;base64,AAA
-        _, _, payload = payload.partition(",")
-    try:
-        data = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValidationError("'imageBase64' is not valid base64") from exc
-    if not data:
-        raise ValidationError("'imageBase64' decoded to an empty file")
+def parse_size_bytes(value):
+    """The declared size of the file the client is about to upload.
+
+    It is signed into the upload policy as an exact content-length range, so S3
+    itself refuses a body of any other size and the recorded size can be trusted.
+    """
+    # bool is a subclass of int, and a JSON `true` must not pass as 1 byte.
+    if value is None:
+        raise ValidationError("'sizeBytes' is required")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("'sizeBytes' must be an integer")
+    if value < 1:
+        raise ValidationError("'sizeBytes' must be at least 1")
     limit = config.max_image_bytes()
-    if len(data) > limit:
-        raise PayloadTooLargeError(
-            f"Image is {len(data)} bytes; the limit is {limit} bytes"
-        )
-    _verify_signature(data, content_type)
-    return data
+    if value > limit:
+        raise PayloadTooLargeError(f"Image is {value} bytes; the limit is {limit} bytes")
+    return value
 
 
-def _verify_signature(data, content_type):
+def verify_signature(head, content_type):
+    """Check the file's leading bytes against the declared content type."""
     signatures = _SIGNATURES.get(content_type, [])
-    if signatures and not any(data.startswith(sig) for sig in signatures):
+    if signatures and not any(head.startswith(sig) for sig in signatures):
         raise ValidationError(
             f"File content does not match the declared contentType '{content_type}'"
         )
-    if content_type == "image/webp" and data[8:12] != b"WEBP":
+    if content_type == "image/webp" and head[8:12] != b"WEBP":
         raise ValidationError(
             "File content does not match the declared contentType 'image/webp'"
         )
+
+
+def validate_user_id(value):
+    if not isinstance(value, str) or not value:
+        raise ValidationError("Caller identity missing: supply the X-User-Id header")
+    if len(value) > MAX_USER_ID_LENGTH or not USER_ID_RE.match(value):
+        raise ValidationError(
+            "Caller identity must be 1-128 characters of letters, digits, '.', '_', '@' or '-'"
+        )
+    return value
 
 
 def normalise_tags(raw):
@@ -188,5 +217,14 @@ def to_iso(moment):
     )
 
 
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
 def utc_now_iso():
-    return to_iso(dt.datetime.now(dt.timezone.utc))
+    return to_iso(utc_now())
+
+
+def epoch_seconds(moment):
+    """DynamoDB TTL wants a Number of epoch seconds, not an ISO string."""
+    return int(moment.timestamp())

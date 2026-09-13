@@ -81,34 +81,55 @@ class TestRepositoryErrorMapping:
 
 
 class TestObjectStoreErrorMapping:
-    def test_put_failure(self, aws, broken_s3):
+    def test_presigned_post_failure(self, aws, broken_s3):
         broken_s3()
         with pytest.raises(StorageError):
-            object_store.put_object("k", b"data", "image/png")
+            object_store.presigned_post("k", "image/png", 70, 60)
 
     def test_delete_failure(self, aws, broken_s3):
         broken_s3()
         with pytest.raises(StorageError):
             object_store.delete_object("k")
 
-    def test_get_failure(self, aws, broken_s3):
+    @pytest.mark.parametrize("operation", ["head_object", "open_object"])
+    def test_read_failure(self, aws, broken_s3, operation):
         broken_s3()
         with pytest.raises(StorageError):
-            object_store.get_object_bytes("k")
+            getattr(object_store, operation)("k")
 
-    def test_missing_object_is_a_404_not_a_502(self, aws, broken_s3):
-        broken_s3("NoSuchKey")
-        with pytest.raises(NotFoundError):
-            object_store.get_object_bytes("k")
+    @pytest.mark.parametrize("code", ["NoSuchKey", "404", "NotFound"])
+    @pytest.mark.parametrize("operation", ["head_object", "open_object"])
+    def test_missing_object_is_none_not_an_error(self, aws, broken_s3, operation, code):
+        """The processor treats a vanished object as a normal outcome, not a retry."""
+        broken_s3(code)
+        assert getattr(object_store, operation)("k") is None
 
-    def test_presign_failure(self, aws, broken_s3):
+    def test_presign_get_failure(self, aws, broken_s3):
         broken_s3()
         with pytest.raises(StorageError):
             object_store.presigned_get_url("k", "f.png", "image/png", 60)
 
-    def test_reads_stored_bytes_when_healthy(self, aws, stored_image):
-        item = repo.get(stored_image["imageId"])
-        assert object_store.get_object_bytes(item["s3Key"]).startswith(b"\x89PNG")
+    def test_streams_stored_bytes_when_healthy(self, aws, stored_image):
+        body = object_store.open_object(repo.get(stored_image["imageId"])["s3Key"])
+        try:
+            assert body.read().startswith(b"\x89PNG")
+        finally:
+            body.close()
+
+
+class TestStateTransitionErrorMapping:
+    @pytest.mark.parametrize("transition", ["mark_ready", "mark_rejected"])
+    def test_condition_failure_means_not_pending(self, aws, broken_table, transition):
+        broken_table("ConditionalCheckFailedException")
+        args = ("x", "k", 1, "sum", "now") if transition == "mark_ready" else ("x", "k", "why", 0)
+        assert getattr(repo, transition)(*args) is None
+
+    @pytest.mark.parametrize("transition", ["mark_ready", "mark_rejected"])
+    def test_other_failures_become_storage_errors(self, aws, broken_table, transition):
+        broken_table()
+        args = ("x", "k", 1, "sum", "now") if transition == "mark_ready" else ("x", "k", "why", 0)
+        with pytest.raises(StorageError):
+            getattr(repo, transition)(*args)
 
 
 class TestHandlerResponsesUnderFailure:
@@ -144,20 +165,33 @@ class TestHandlerResponsesUnderFailure:
         assert response["statusCode"] == 502
 
 
-def test_compensating_delete_failure_still_reports_the_original_error(
+def test_failed_rejection_keeps_the_object_so_a_retry_can_finish(
     aws, context, upload_payload, monkeypatch
 ):
-    """Both the metadata write and the rollback fail; the caller still gets one 500."""
-    monkeypatch.setattr(
-        repo, "put_new", lambda _item: (_ for _ in ()).throw(RuntimeError("ddb down"))
-    )
-    monkeypatch.setattr(
-        object_store,
-        "delete_object",
-        lambda _key: (_ for _ in ()).throw(RuntimeError("s3 down")),
-    )
-    response = upload_image.handler(api_event("POST", body=upload_payload()), context)
-    assert response["statusCode"] == 500
+    """Reject marks the row before deleting the object, never the other way round.
+
+    If the row update fails, the object must survive: the Lambda retry needs it
+    to reach the same verdict, and deleting first would strand a pending row
+    whose bytes are already gone.
+    """
+    from tests.conftest import PDF_BYTES, client_upload, process, register, s3_keys
+
+    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    key = client_upload(registered, PDF_BYTES)
+
+    def unavailable(*_args):
+        raise StorageError("Could not update image metadata")
+
+    real_mark_rejected = repo.mark_rejected
+    monkeypatch.setattr(repo, "mark_rejected", unavailable)
+    with pytest.raises(StorageError):
+        process(context, key)
+    assert s3_keys() == [key]
+
+    # DynamoDB recovers; the Lambda retry delivers the same event again.
+    monkeypatch.setattr(repo, "mark_rejected", real_mark_rejected)
+    assert process(context, key)["processed"][0]["outcome"] == "rejected"
+    assert s3_keys() == []
 
 
 def test_service_layer_is_transport_agnostic(aws, upload_payload):
@@ -168,3 +202,4 @@ def test_service_layer_is_transport_agnostic(aws, upload_payload):
         image_service.delete_image("missing")
     with pytest.raises(NotFoundError):
         image_service.build_download("missing")
+    assert image_service.process_uploaded_object("not/an/upload/key") == "ignored"
