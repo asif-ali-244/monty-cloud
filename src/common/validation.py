@@ -10,11 +10,7 @@ import os
 import re
 
 from src.common import config
-from src.common.errors import (
-    PayloadTooLargeError,
-    UnsupportedMediaTypeError,
-    ValidationError,
-)
+from src.common.errors import UnsupportedMediaTypeError, ValidationError
 
 MAX_FILENAME_LENGTH = 255
 MAX_TAGS = 20
@@ -41,9 +37,6 @@ SIGNATURE_PREFIX_BYTES = 12
 
 def reject_unknown_fields(payload, allowed):
     """Refuse fields the contract does not define instead of silently ignoring them.
-
-    A client that still sends the retired ``imageBase64`` should hear that the
-    bytes were not accepted, not get a 201 for an image that will never arrive.
     """
     unknown = sorted(set(payload) - set(allowed))
     if unknown:
@@ -93,25 +86,6 @@ def validate_content_type(value):
             )
         )
     return normalised
-
-
-def parse_size_bytes(value):
-    """The declared size of the file the client is about to upload.
-
-    It is signed into the upload policy as an exact content-length range, so S3
-    itself refuses a body of any other size and the recorded size can be trusted.
-    """
-    # bool is a subclass of int, and a JSON `true` must not pass as 1 byte.
-    if value is None:
-        raise ValidationError("'sizeBytes' is required")
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValidationError("'sizeBytes' must be an integer")
-    if value < 1:
-        raise ValidationError("'sizeBytes' must be at least 1")
-    limit = config.max_image_bytes()
-    if value > limit:
-        raise PayloadTooLargeError(f"Image is {value} bytes; the limit is {limit} bytes")
-    return value
 
 
 def verify_signature(head, content_type):

@@ -44,8 +44,8 @@ Thick arrows carry image bytes. None pass through API Gateway or Lambda.
 
 - **Language / runtime**: Python (Lambda `python3.12`; source targets 3.7+ syntax)
 - **Infrastructure**: Terraform, one configuration for both LocalStack and AWS
-- **Tests**: 337 unit tests against [moto](https://github.com/getmoto/moto), 100% line coverage,
-  including OpenAPI contract tests; plus a 39-check live smoke test and a Postman
+- **Tests**: 317 unit tests against [moto](https://github.com/getmoto/moto), 100% line coverage,
+  including OpenAPI contract tests; plus a 41-check live smoke test and a Postman
   collection verified with newman
 
 ---
@@ -56,7 +56,7 @@ Requires Docker, Terraform ≥ 1.5 and Python 3.9+.
 
 ```bash
 make install     # virtualenv + dev dependencies
-make test        # 337 unit tests, no AWS or Docker needed
+make test        # 317 unit tests, no AWS or Docker needed
 make up          # start LocalStack, wait for health
 make deploy      # package the Lambdas and terraform apply
 make seed        # load six sample images through the full upload flow
@@ -92,9 +92,8 @@ Full reference: **[docs/API.md](docs/API.md)**. Machine-readable spec:
 Uploading is three steps — register, send the file to S3, wait for `ready`:
 
 ```bash
-SIZE=$(wc -c < sunset.png | tr -d ' ')
 RESP=$(curl -sS -X POST "$API/images" -H 'Content-Type: application/json' -H 'X-User-Id: alice' \
-  -d "{\"filename\":\"sunset.png\",\"contentType\":\"image/png\",\"sizeBytes\":$SIZE,\"tags\":[\"beach\"]}")
+  -d '{"filename":"sunset.png","contentType":"image/png","tags":["beach"]}')
 ID=$(jq -r .image.imageId <<<"$RESP")
 
 FORM=()
@@ -148,8 +147,8 @@ policy.
 | `createdAt` | string | When the image was registered |
 | `uploadedAt` | string | GSI sort key. **Written only when the upload is verified** |
 | `filename`, `filenameLower` | string | The second is the case-insensitive search field |
-| `contentType`, `sizeBytes` | | Declared at registration; verified by the processor |
-| `checksumSha256` | string | Computed by the processor; ready images only |
+| `contentType` | string | Declared at registration; verified by the processor |
+| `sizeBytes`, `checksumSha256` | | Measured by the processor; ready images only |
 | `rejectionReason` | string | Rejected images only |
 | `tags` | list | Normalised, de-duplicated |
 | `description` | string | Present only when supplied |
@@ -182,18 +181,20 @@ decision, and upload throughput scales with S3 rather than with Lambda concurren
 
 **A POST policy, not a presigned PUT.** A presigned PUT URL cannot constrain the
 body. A POST policy can, and S3 enforces it before storing anything: the exact
-key, the exact `Content-Type`, and a content-length range pinned to the declared
-`sizeBytes`. That is why `sizeBytes` is required at registration — it turns the
-recorded size into a guarantee, lets an oversized image fail with a JSON `413`
-before any upload, and makes the size limit S3's job instead of ours. Verified
-against LocalStack: a wrong size gets `400 EntityTooLarge`, a tampered type or key
-`403 AccessDenied`.
+key, the exact `Content-Type`, and a body of 1 byte up to the size limit. Verified
+against LocalStack: a file one byte over the limit gets `400 EntityTooLarge`, an
+empty file `400 EntityTooSmall`, and a tampered type or key `403 AccessDenied`.
+
+**The size limit is S3's job.** The policy's range enforces it on every upload,
+and the processor records the size it measures while hashing. The form also
+carries `maxSizeBytes`, so a client can reject an oversized file before sending
+any bytes; S3 refuses the upload if it does not.
 
 **Verification happens after the upload, asynchronously.** A policy cannot check
 what the bytes *are*, so an S3 `ObjectCreated` event triggers `process-upload`,
 which checks the magic bytes against the declared type, streams the object once
-to compute its SHA-256 (1 MiB chunks, flat memory, stopping at the first chunk if
-the signature is wrong), and moves the row to `ready` — or to `rejected`, deleting
+to measure it and compute its SHA-256 (1 MiB chunks, flat memory, stopping early
+if the signature is wrong or the size passes the limit), and moves the row to `ready` — or to `rejected`, deleting
 the object. The cost is that an image is not listable the instant it is stored;
 the client polls `GET /images/{id}`. Against LocalStack the transition takes one
 to two seconds from a cold processor, and milliseconds from a warm one.
@@ -273,7 +274,7 @@ rather than at import so tests can vary it without reimporting modules.
 ## Testing
 
 ```bash
-make test    # 337 tests, ~30s
+make test    # 317 tests, ~35s
 make cov     # with a coverage report
 make lint    # ruff + terraform fmt
 ```
@@ -283,7 +284,7 @@ They cover every handler end to end, the service and repository layers, all
 validation and type rules, pagination, every filter combination, multi-user
 concurrency, and the AWS-failure paths.
 
-`tests/test_process_upload.py` (35 tests) concentrates on what an async,
+`tests/test_process_upload.py` (38 tests) concentrates on what an async,
 client-controlled upload path gets wrong: duplicate events, deletes racing
 uploads, rows changing mid-hash, objects at keys no row owns, URL-encoded keys,
 hostile content that lies about its type, early termination of the hash on a bad
@@ -299,12 +300,13 @@ Moto signs presigned POSTs but does not enforce their policies, so the unit test
 simulate the client's upload with a direct `put_object`. What only a real S3 can
 prove is covered live:
 
-- `make smoke` — 39 checks against the deployed stack: the full lifecycle, S3
-  refusing uploads of the wrong size, type or key, the processor rejecting a PDF
+- `make smoke` — 41 checks against the deployed stack: the full lifecycle, S3
+  refusing uploads that are empty, over the size limit, or carry a tampered type
+  or key, the processor rejecting a PDF
   sent as a PNG, byte-for-byte download comparison, and a late upload failing to
   resurrect a deleted image.
 - `npx newman run docs/postman_collection.json --env-var baseUrl=$API` — the
-  Postman collection, 38 assertions, including the S3 upload and the poll loop.
+  Postman collection, 37 assertions, including the S3 upload and the poll loop.
 
 Run a single test or a subset:
 
@@ -343,7 +345,7 @@ src/
   services/     image_service (business logic), metadata_repository (DynamoDB), object_store (S3)
   common/       config, errors, validation, response builders, the API handler decorator
 terraform/      storage.tf, lambda.tf (functions, IAM, S3 notification), apigateway.tf, variables
-tests/          337 unit tests, including the processor and OpenAPI contract suites
+tests/          317 unit tests, including the processor and OpenAPI contract suites
 scripts/        package.sh, seed_local.py, smoke_test.py
 docs/           API.md, openapi.yaml, postman_collection.json, sample.png
 ```

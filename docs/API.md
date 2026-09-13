@@ -123,7 +123,7 @@ product limit — 20 MB by default — and S3 enforces it.
 | `status` | Meaning | Listed? | `/content` |
 |---|---|---|---|
 | `pending` | Registered; file not yet uploaded or not yet verified | No | `409` |
-| `ready` | Verified: `checksumSha256` and `uploadedAt` are set | Yes | `302` |
+| `ready` | Verified: `sizeBytes`, `checksumSha256` and `uploadedAt` are set | Yes | `302` |
 | `rejected` | The uploaded file failed verification; see `rejectionReason`. The object has been deleted | No | `409` |
 
 A `pending` image whose file never arrives expires on its own about an hour after
@@ -136,13 +136,12 @@ Verified against LocalStack with macOS's bash 3.2 and `jq`:
 
 ```bash
 FILE=sunset.png
-SIZE=$(wc -c < "$FILE" | tr -d ' ')
 
-# 1. Register: metadata and size only, no bytes.
+# 1. Register: metadata only, no bytes.
 RESP=$(curl -sS -X POST "$API/images" \
   -H 'Content-Type: application/json' \
   -H 'X-User-Id: alice' \
-  -d "{\"filename\": \"$FILE\", \"contentType\": \"image/png\", \"sizeBytes\": $SIZE, \"tags\": [\"beach\", \"sunset\"]}")
+  -d "{\"filename\": \"$FILE\", \"contentType\": \"image/png\", \"tags\": [\"beach\", \"sunset\"]}")
 ID=$(jq -r .image.imageId <<<"$RESP")
 
 # 2. Upload straight to S3: every signed field as-is, then the file, last.
@@ -185,7 +184,8 @@ byte. These failures come from S3, as XML, not from this API:
 
 | Attempt | S3 response |
 |---|---|
-| Body larger or smaller than the declared `sizeBytes` | `400 EntityTooLarge` / `EntityTooSmall` |
+| File larger than `upload.maxSizeBytes` | `400 EntityTooLarge` |
+| Empty file | `400 EntityTooSmall` |
 | `Content-Type` field changed | `403 AccessDenied` (policy condition failed) |
 | `key` field changed | `403 AccessDenied` (policy condition failed) |
 | Form used after `upload.expiresAt` | `403 AccessDenied` (policy expired) |
@@ -198,11 +198,13 @@ image's object is deleted and the reason is recorded:
 | Problem | `rejectionReason` |
 |---|---|
 | Leading bytes are not the declared type — a PDF sent as `image/png` | `File content does not match the declared contentType 'image/png'` |
-| Stored size differs from the declaration | `Uploaded 81 bytes but 70 were declared` |
-| Stored content type differs from the declaration | `Uploaded as 'text/html' but 'image/png' was declared` |
+| Stored object over the size limit | `Uploaded 20971521 bytes; the limit is 20971520 bytes` |
+| Stored object is empty | `Uploaded file is empty` |
+| Stored content type differs from the declared one | `Uploaded as 'text/html' but 'image/png' was declared` |
 
-The last two cannot happen through the signed form; they are defence in depth
-against an object reaching the key some other way.
+The last three cannot happen through the signed form; they are defence in depth
+against an object reaching the key some other way. The size recorded on a ready
+image is the one the processor measured while hashing.
 
 ---
 
@@ -230,7 +232,6 @@ the file. No bytes are sent in this request.
 |---|---|---|---|
 | `filename` | string | yes | 1–255 chars. Any directory component is stripped: `../../etc/passwd.png` is stored as `passwd.png` |
 | `contentType` | string | yes | `image/jpeg`, `image/png`, `image/gif`, `image/webp` |
-| `sizeBytes` | integer | yes | Exact file size, 1 to 20 971 520. A JSON integer — `"70"`, `70.0` and `true` are all `400` |
 | `tags` | string[] | no | ≤ 20 items, each ≤ 50 chars matching `[a-z0-9][a-z0-9_-]*`. Lowercased and de-duplicated on write. A comma-separated string is also accepted |
 | `description` | string | no | ≤ 1024 chars |
 
@@ -238,10 +239,10 @@ Any other field is a `400`. That includes `imageBase64`, which earlier versions
 of this API accepted — a client still sending it hears so, instead of receiving a
 `201` for an image that will never arrive.
 
-`sizeBytes` is required because it is signed into the upload policy as an exact
-content length. S3 then refuses a body of any other size, so the recorded size can
-be trusted from the start, and a size over the limit fails here with `413` before
-any upload is attempted.
+The size limit is enforced by S3, not by this request. The upload form accepts 1 byte up to
+`upload.maxSizeBytes`, and S3 refuses anything outside that range when the file is
+sent. A client that wants to fail before uploading should compare its file
+against `maxSizeBytes` itself.
 
 **Request**
 
@@ -249,7 +250,7 @@ any upload is attempted.
 curl -sS -X POST "$API/images" \
   -H 'Content-Type: application/json' \
   -H 'X-User-Id: alice' \
-  -d '{"filename": "sunset.png", "contentType": "image/png", "sizeBytes": 70,
+  -d '{"filename": "sunset.png", "contentType": "image/png",
        "tags": ["beach", "sunset"], "description": "Golden hour"}'
 ```
 
@@ -262,7 +263,6 @@ curl -sS -X POST "$API/images" \
     "userId": "alice",
     "filename": "sunset.png",
     "contentType": "image/png",
-    "sizeBytes": 70,
     "tags": ["beach", "sunset"],
     "description": "Golden hour",
     "status": "pending",
@@ -272,6 +272,7 @@ curl -sS -X POST "$API/images" \
     "method": "POST",
     "url": "http://localhost:4566/monty-images-local-bucket",
     "fileField": "file",
+    "maxSizeBytes": 20971520,
     "fields": {
       "Content-Type": "image/png",
       "key": "images/alice/334d3b476eba4fbfa2b00e2aa4792a8a.png",
@@ -288,8 +289,7 @@ curl -sS -X POST "$API/images" \
 ```
 
 **Failures** — `400` malformed, missing, mistyped or unknown field, or bad
-`X-User-Id` · `413` `sizeBytes` over the limit · `415` unsupported `contentType` ·
-`502` DynamoDB unavailable.
+`X-User-Id` · `415` unsupported `contentType` · `502` DynamoDB unavailable.
 
 ---
 
@@ -373,7 +373,7 @@ Fields present only in some states:
 
 | Field | Present when |
 |---|---|
-| `checksumSha256`, `uploadedAt` | `ready` |
+| `sizeBytes`, `checksumSha256`, `uploadedAt` | `ready` |
 | `rejectionReason` | `rejected` |
 | `description` | it was supplied at registration |
 
@@ -575,7 +575,6 @@ Branch on `code`; `error` is for humans and its wording may change.
 | `404` | `NotFound` | No image with that id | No |
 | `409` | `ImageNotReady` | Content requested for an image that is pending or rejected | Yes, if pending — poll `GET /images/{id}` first |
 | `409` | `Conflict` | Image id already exists (not reachable in normal use) | No |
-| `413` | `PayloadTooLarge` | Declared `sizeBytes` over the size limit | No — shrink the image |
 | `415` | `UnsupportedMediaType` | `contentType` is not an accepted image type | No |
 | `502` | `StorageError` | S3 or DynamoDB call failed | Yes, with backoff |
 | `500` | `InternalError` | Unexpected failure | Yes, with backoff |
@@ -621,7 +620,6 @@ def upload(path, tags=(), description=None, timeout=60):
     body = {
         "filename": path.name,
         "contentType": mimetypes.guess_type(path.name)[0],
-        "sizeBytes": path.stat().st_size,
         "tags": list(tags),
     }
     if description:
@@ -629,6 +627,8 @@ def upload(path, tags=(), description=None, timeout=60):
     registered = SESSION.post(f"{API}/images", json=body, timeout=30)
     registered.raise_for_status()
     image, form = registered.json()["image"], registered.json()["upload"]
+    if path.stat().st_size > form["maxSizeBytes"]:
+        raise ValueError(f"{path} is larger than {form['maxSizeBytes']} bytes")
 
     # requests sends `data` fields before `files`, which is the order S3 needs.
     with path.open("rb") as handle:
@@ -696,7 +696,6 @@ async function upload(file, { tags = [], userId = "alice" } = {}) {
     body: JSON.stringify({
       filename: file.name,
       contentType: file.type,
-      sizeBytes: file.size,
       tags,
     }),
   });
@@ -705,6 +704,9 @@ async function upload(file, { tags = [], userId = "alice" } = {}) {
     throw new Error(`${code}: ${error}`);
   }
   const { image, upload } = await registered.json();
+  if (file.size > upload.maxSizeBytes) {
+    throw new Error(`File is larger than ${upload.maxSizeBytes} bytes`);
+  }
 
   // Signed fields first, file last. Let the browser set the multipart boundary.
   const form = new FormData();
@@ -738,7 +740,8 @@ function thumbnail(imageId) {
 }
 ```
 
-`File.size` and `File.type` supply `sizeBytes` and `contentType` directly. Do not
+`File.type` supplies `contentType` directly, and comparing `File.size` against
+`upload.maxSizeBytes` fails an oversized file before any bytes are sent. Do not
 set a `Content-Type` header on the S3 request yourself — the browser has to
 generate the multipart boundary.
 
@@ -791,8 +794,18 @@ upload request's `file` field. The collection registers the image, uploads the
 file to S3 with the signed fields it captured, polls until the image is ready,
 and then runs the read and delete requests top to bottom.
 
+Two things trip up a first run:
+
+- **Set the variable's *Current value*.** Postman sends the Current value, not
+  the Initial value, so editing only the Initial column leaves requests pointed at
+  the `REPLACE_ME` placeholder.
+- **Refresh `baseUrl` after LocalStack restarts.** The REST API id in the URL is
+  regenerated on every fresh deploy. An unknown id gets an empty `404` from
+  LocalStack, which the collection reports as "baseUrl is wrong or stale".
+
 **Command line** — `make seed` loads six sample images across three users through
-the full upload flow, and `make smoke` runs 39 end-to-end assertions over the
-deployed stack. They include S3 refusing uploads of the wrong size, type or key,
+the full upload flow, and `make smoke` runs 41 end-to-end assertions over the
+deployed stack. They include S3 refusing uploads that are empty, over the size
+limit, or carry a tampered type or key,
 the processor rejecting a PDF sent as a PNG, and a byte-for-byte comparison of the
 downloaded file.

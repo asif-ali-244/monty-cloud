@@ -187,7 +187,7 @@ def test_downloading_a_pending_image_is_409(aws, context, pending_image):
 def test_downloading_a_rejected_image_is_409_with_the_reason(aws, context, upload_payload):
     from tests.conftest import PDF_BYTES, client_upload, process, register
 
-    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    registered = register(context, upload_payload())
     process(context, client_upload(registered, PDF_BYTES))
 
     response = download_image.handler(

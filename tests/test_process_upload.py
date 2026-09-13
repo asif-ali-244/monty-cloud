@@ -68,7 +68,7 @@ class TestHappyPath:
     ):
         registered = register(
             context,
-            upload_payload(contentType=content_type, sizeBytes=len(data), filename="a.bin"),
+            upload_payload(contentType=content_type, filename="a.bin"),
         )
         key = client_upload(registered, data)
         assert outcome(process(context, key)) == ["ready"]
@@ -76,7 +76,7 @@ class TestHappyPath:
     def test_hashes_files_larger_than_one_read_chunk(self, aws, context, upload_payload):
         """The object is streamed in 1 MiB chunks; the digest must cover all of them."""
         data = PNG_BYTES + b"\x00" * (3 * 1024 * 1024 + 17)
-        registered = register(context, upload_payload(sizeBytes=len(data)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, data)
         process(context, key)
 
@@ -96,7 +96,7 @@ class TestHappyPath:
 class TestRejections:
     def test_content_that_is_not_the_declared_type(self, aws, context, upload_payload):
         """A PDF uploaded as image/png is caught by its magic bytes."""
-        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, PDF_BYTES)
 
         assert outcome(process(context, key)) == ["rejected"]
@@ -108,20 +108,34 @@ class TestRejections:
     def test_webp_container_without_the_webp_marker(self, aws, context, upload_payload):
         riff = b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 16
         registered = register(
-            context, upload_payload(contentType="image/webp", sizeBytes=len(riff))
+            context, upload_payload(contentType="image/webp")
         )
         key = client_upload(registered, riff)
         assert outcome(process(context, key)) == ["rejected"]
 
-    def test_size_different_from_the_declared_size(self, aws, context, upload_payload):
+    def test_object_over_the_size_limit(self, aws, context, pending_image, monkeypatch):
         """The policy prevents this; the processor checks anyway."""
-        registered = register(context, upload_payload(sizeBytes=len(PNG_BYTES)))
-        key = client_upload(registered, PNG_BYTES + b"extra")
+        monkeypatch.setenv("MAX_IMAGE_BYTES", str(len(PNG_BYTES) - 1))
+        key = client_upload(pending_image, PNG_BYTES)
 
         assert outcome(process(context, key)) == ["rejected"]
-        reason = fetch_image(context, registered["image"]["imageId"])["rejectionReason"]
-        assert f"{len(PNG_BYTES)} were declared" in reason
+        reason = fetch_image(context, pending_image["image"]["imageId"])["rejectionReason"]
+        assert reason == f"Uploaded {len(PNG_BYTES)} bytes; the limit is {len(PNG_BYTES) - 1} bytes"
         assert s3_keys() == []
+
+    def test_empty_object(self, aws, context, pending_image):
+        """The policy's 1-byte minimum prevents this; the processor checks anyway."""
+        key = client_upload(pending_image, b"")
+        assert outcome(process(context, key)) == ["rejected"]
+        image = fetch_image(context, pending_image["image"]["imageId"])
+        assert image["rejectionReason"] == "Uploaded file is empty"
+
+    def test_size_is_measured_from_the_stored_object(self, aws, context, pending_image):
+        key = client_upload(pending_image, PNG_BYTES)
+        process(context, key)
+        assert fetch_image(context, pending_image["image"]["imageId"])["sizeBytes"] == len(
+            PNG_BYTES
+        )
 
     def test_stored_content_type_different_from_the_declared_one(
         self, aws, context, pending_image
@@ -134,12 +148,12 @@ class TestRejections:
 
     def test_file_shorter_than_the_signature(self, aws, context, upload_payload):
         tiny = b"\x89P"
-        registered = register(context, upload_payload(sizeBytes=len(tiny)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, tiny)
         assert outcome(process(context, key)) == ["rejected"]
 
     def test_rejected_rows_expire_after_the_retention_window(self, aws, context, upload_payload):
-        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, PDF_BYTES)
         before = int(dt.datetime.now(dt.timezone.utc).timestamp())
         process(context, key)
@@ -149,7 +163,7 @@ class TestRejections:
         assert expected <= expires <= expected + 5
 
     def test_rejected_rows_never_reach_the_user_index(self, aws, context, upload_payload):
-        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        registered = register(context, upload_payload())
         process(context, client_upload(registered, PDF_BYTES))
         assert "uploadedAt" not in table_item(registered["image"]["imageId"])
 
@@ -161,7 +175,7 @@ class TestRejections:
 
         monkeypatch.setattr(image_service, "_HASH_CHUNK_BYTES", 64)
         data = PDF_BYTES + b"\x00" * 10_000
-        registered = register(context, upload_payload(sizeBytes=len(data)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, data)
 
         chunks_read = []
@@ -243,7 +257,7 @@ class TestRacesAndRedelivery:
     def test_retry_after_a_rejection_whose_delete_failed(self, aws, context, upload_payload):
         from src.services import metadata_repository as repo
 
-        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        registered = register(context, upload_payload())
         key = client_upload(registered, PDF_BYTES)
         repo.mark_rejected(registered["image"]["imageId"], key, "earlier attempt", 0)
 
@@ -355,14 +369,16 @@ class TestTransientFailures:
 
 
 def test_object_replaced_between_head_and_read(aws, context, pending_image, monkeypatch):
-    """HEAD said the size matched, but the bytes actually streamed do not.
+    """HEAD said the object was within the limit, but the bytes streamed are not.
 
-    Only reachable if the object is overwritten mid-processing; the hashed size
-    is the one trusted, not the earlier HEAD.
+    Only reachable if the object is overwritten mid-processing; the size measured
+    while hashing is the one trusted, not the earlier HEAD.
     """
     from src.services import image_service
 
-    key = client_upload(pending_image, PNG_BYTES + b"overwritten")
+    data = PNG_BYTES + b"overwritten"
+    monkeypatch.setenv("MAX_IMAGE_BYTES", str(len(PNG_BYTES)))
+    key = client_upload(pending_image, data)
     real_head = image_service.object_store.head_object
 
     def stale_head(object_key):
@@ -372,4 +388,41 @@ def test_object_replaced_between_head_and_read(aws, context, pending_image, monk
     monkeypatch.setattr(image_service.object_store, "head_object", stale_head)
     assert outcome(process(context, key)) == ["rejected"]
     reason = fetch_image(context, pending_image["image"]["imageId"])["rejectionReason"]
-    assert f"Uploaded {len(PNG_BYTES) + len(b'overwritten')} bytes" in reason
+    assert reason == f"Uploaded {len(data)} bytes; the limit is {len(PNG_BYTES)} bytes"
+
+
+def test_hashing_stops_as_soon_as_the_stream_passes_the_limit(
+    aws, context, pending_image, monkeypatch
+):
+    """An object that grows past the limit mid-read is not hashed to the end."""
+    from src.services import image_service
+
+    monkeypatch.setattr(image_service, "_HASH_CHUNK_BYTES", 64)
+    data = PNG_BYTES + b"\x00" * 10_000
+    monkeypatch.setenv("MAX_IMAGE_BYTES", "100")
+    key = client_upload(pending_image, data)
+    real_head = image_service.object_store.head_object
+    monkeypatch.setattr(
+        image_service.object_store,
+        "head_object",
+        lambda object_key: {**real_head(object_key), "ContentLength": 50},
+    )
+
+    chunks_read = []
+    real_open = image_service.object_store.open_object
+
+    def counting_open(object_key):
+        body = real_open(object_key)
+        original = body.iter_chunks
+
+        def iter_chunks(chunk_size):
+            for chunk in original(chunk_size=chunk_size):
+                chunks_read.append(len(chunk))
+                yield chunk
+
+        body.iter_chunks = iter_chunks
+        return body
+
+    monkeypatch.setattr(image_service.object_store, "open_object", counting_open)
+    assert outcome(process(context, key)) == ["rejected"]
+    assert len(chunks_read) == 2

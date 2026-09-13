@@ -6,8 +6,9 @@ upload straight to S3 on the presigned POST, wait for the S3-triggered processor
 then list, get, download (byte-comparing the file), and delete.
 
 It also exercises what the unit tests cannot, because moto does not enforce POST
-policies: S3 itself refusing an upload of the wrong size, type or key, and the
-processor rejecting content that lies about its type.
+policies: S3 itself refusing an upload that is empty, over the size limit, or
+has a tampered type or key, and the processor rejecting content that lies about
+its type.
 """
 
 import argparse
@@ -94,7 +95,6 @@ def register(base_url, **overrides):
     payload = {
         "filename": "smoke.png",
         "contentType": "image/png",
-        "sizeBytes": len(PNG_1X1),
         "tags": ["smoke", "test"],
         "description": "smoke test image",
     }
@@ -140,11 +140,13 @@ def main():
     upload = registered["upload"]
     image_id = image["imageId"]
     check("image starts pending", image["status"] == "pending")
-    check("records the declared size", image["sizeBytes"] == len(PNG_1X1))
+    check("size is not known until the upload is verified", "sizeBytes" not in image)
     check("normalises tags", image["tags"] == ["smoke", "test"])
     check("hides the s3 key", "s3Key" not in image)
     check("sets Location", headers.get("Location") == f"/images/{image_id}")
     check("returns a POST form", upload["method"] == "POST" and "policy" in upload["fields"])
+    max_bytes = upload.get("maxSizeBytes")
+    check("advertises the size limit", isinstance(max_bytes, int) and max_bytes > 0)
 
     print("\nbefore the upload")
     status, _, _ = call(base_url, "GET", f"/images/{image_id}/content")
@@ -154,8 +156,11 @@ def main():
     check("pending image is not listed", image_id not in listed)
 
     print("\nS3 enforces the upload policy")
-    status, body = upload_to_s3(upload, PNG_1X1 + b"extra bytes", "image/png")
-    check("refuses a body larger than declared", status in (400, 403), f"got {status}")
+    oversized = PNG_1X1 + b"\x00" * (max_bytes + 1 - len(PNG_1X1))
+    status, body = upload_to_s3(upload, oversized, "image/png")
+    check("refuses a file one byte over the limit", status == 400, f"got {status} {body[:120]}")
+    status, body = upload_to_s3(upload, b"", "image/png")
+    check("refuses an empty file", status == 400, f"got {status} {body[:120]}")
     tampered = dict(upload["fields"], **{"Content-Type": "text/html"})
     status, body = upload_to_s3(upload, PNG_1X1, "text/html", fields=tampered)
     check("refuses a tampered Content-Type", status == 403, f"got {status}")
@@ -169,6 +174,7 @@ def main():
     settled = wait_until_settled(base_url, image_id)
     status = settled.get("status")
     check("processor marks it ready", status == "ready", f"got {status}")
+    check("records the measured size", settled.get("sizeBytes") == len(PNG_1X1))
     check(
         "records the verified checksum",
         settled.get("checksumSha256") == hashlib.sha256(PNG_1X1).hexdigest(),
@@ -178,13 +184,11 @@ def main():
     print("\nvalidation")
     status, _, body = register(base_url, contentType="application/pdf")
     check("rejects unsupported type with 415", status == 415, f"got {status}")
-    status, _, body = register(base_url, sizeBytes=10**12)
-    check("rejects an oversized declaration with 413", status == 413, f"got {status}")
     status, _, body = register(base_url, imageBase64="aGVsbG8=")
     check("rejects the retired imageBase64 field with 400", status == 400, f"got {status}")
 
     print("\ncontent that lies about its type")
-    status, _, lying = register(base_url, filename="not-really.png", sizeBytes=len(PDF_BYTES))
+    status, _, lying = register(base_url, filename="not-really.png")
     upload_to_s3(lying["upload"], PDF_BYTES, "image/png")
     rejected = wait_until_settled(base_url, lying["image"]["imageId"])
     status = rejected.get("status")

@@ -94,7 +94,7 @@ def test_deletes_a_pending_image_that_has_no_object_yet(aws, context, pending_im
 def test_deletes_a_rejected_image(aws, context, upload_payload):
     from tests.conftest import PDF_BYTES, client_upload, process, register
 
-    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    registered = register(context, upload_payload())
     process(context, client_upload(registered, PDF_BYTES))
     image_id = registered["image"]["imageId"]
 

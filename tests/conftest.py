@@ -149,7 +149,6 @@ def upload_payload():
         payload = {
             "filename": "sunset.png",
             "contentType": "image/png",
-            "sizeBytes": len(PNG_BYTES),
             "tags": ["beach", "sunset"],
             "description": "Golden hour",
         }

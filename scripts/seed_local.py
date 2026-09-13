@@ -82,7 +82,6 @@ def seed_one(base_url, user, filename, tags, description):
         {
             "filename": filename,
             "contentType": "image/png",
-            "sizeBytes": len(PNG_1X1),
             "tags": tags,
             "description": description,
         },

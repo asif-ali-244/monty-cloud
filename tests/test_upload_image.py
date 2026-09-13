@@ -9,10 +9,6 @@ import pytest
 from src.common import config
 from src.handlers import upload_image
 from tests.conftest import (
-    GIF_BYTES,
-    JPEG_BYTES,
-    PNG_BYTES,
-    WEBP_BYTES,
     api_event,
     body_of,
     s3_keys,
@@ -39,7 +35,6 @@ class TestRegistration:
         assert image["status"] == "pending"
         assert image["filename"] == "sunset.png"
         assert image["contentType"] == "image/png"
-        assert image["sizeBytes"] == len(PNG_BYTES)
         assert image["userId"] == "user-alice"
         assert image["tags"] == ["beach", "sunset"]
         assert image["description"] == "Golden hour"
@@ -50,7 +45,7 @@ class TestRegistration:
         self, aws, context, upload_payload
     ):
         image = body_of(post(context, upload_payload()))["image"]
-        for field in ("uploadedAt", "checksumSha256", "rejectionReason"):
+        for field in ("sizeBytes", "uploadedAt", "checksumSha256", "rejectionReason"):
             assert field not in image
 
     def test_upload_form_targets_the_server_chosen_key(self, aws, context, upload_payload):
@@ -63,6 +58,7 @@ class TestRegistration:
         assert upload["fields"]["key"] == f"images/user-alice/{body['image']['imageId']}.png"
         assert upload["fields"]["Content-Type"] == "image/png"
         assert {"policy", "x-amz-signature", "x-amz-algorithm"} <= set(upload["fields"])
+        assert upload["maxSizeBytes"] == config.DEFAULT_MAX_IMAGE_BYTES
 
     def test_no_bytes_are_stored_at_registration(self, aws, context, upload_payload):
         post(context, upload_payload())
@@ -111,9 +107,17 @@ class TestRegistration:
 class TestUploadPolicy:
     """The policy is what S3 enforces, so its conditions are the real contract."""
 
-    def test_pins_the_content_length_to_the_declared_size(self, aws, context, upload_payload):
-        policy = policy_of(body_of(post(context, upload_payload(sizeBytes=4321))))
-        assert ["content-length-range", 4321, 4321] in policy["conditions"]
+    def test_limits_the_body_to_between_one_byte_and_the_size_limit(
+        self, aws, context, upload_payload
+    ):
+        policy = policy_of(body_of(post(context, upload_payload())))
+        assert ["content-length-range", 1, config.DEFAULT_MAX_IMAGE_BYTES] in policy["conditions"]
+
+    def test_size_limit_is_configurable(self, aws, context, upload_payload, monkeypatch):
+        monkeypatch.setenv("MAX_IMAGE_BYTES", "1024")
+        body = body_of(post(context, upload_payload()))
+        assert ["content-length-range", 1, 1024] in policy_of(body)["conditions"]
+        assert body["upload"]["maxSizeBytes"] == 1024
 
     def test_pins_the_content_type(self, aws, context, upload_payload):
         policy = policy_of(body_of(post(context, upload_payload())))
@@ -135,20 +139,18 @@ class TestUploadPolicy:
 
 
 @pytest.mark.parametrize(
-    "content_type,extension,size",
+    "content_type,extension",
     [
-        ("image/jpeg", ".jpg", len(JPEG_BYTES)),
-        ("image/png", ".png", len(PNG_BYTES)),
-        ("image/gif", ".gif", len(GIF_BYTES)),
-        ("image/webp", ".webp", len(WEBP_BYTES)),
+        ("image/jpeg", ".jpg"),
+        ("image/png", ".png"),
+        ("image/gif", ".gif"),
+        ("image/webp", ".webp"),
     ],
 )
 def test_key_extension_follows_the_content_type(
-    aws, context, upload_payload, content_type, extension, size
+    aws, context, upload_payload, content_type, extension
 ):
-    body = body_of(
-        post(context, upload_payload(contentType=content_type, filename="a.bin", sizeBytes=size))
-    )
+    body = body_of(post(context, upload_payload(contentType=content_type, filename="a.bin")))
     assert body["upload"]["fields"]["key"].endswith(extension)
 
 
@@ -200,13 +202,6 @@ class TestIdentity:
         ({"filename": 42}, 400, "'filename' must be a string"),
         ({"contentType": None}, 400, "'contentType' is required"),
         ({"contentType": "application/pdf"}, 415, "contentType"),
-        ({"sizeBytes": None}, 400, "'sizeBytes' is required"),
-        ({"sizeBytes": "70"}, 400, "'sizeBytes' must be an integer"),
-        ({"sizeBytes": 70.5}, 400, "'sizeBytes' must be an integer"),
-        ({"sizeBytes": True}, 400, "'sizeBytes' must be an integer"),
-        ({"sizeBytes": 0}, 400, "at least 1"),
-        ({"sizeBytes": -5}, 400, "at least 1"),
-        ({"sizeBytes": 20 * 1024 * 1024 + 1}, 413, "the limit is"),
         ({"tags": "not,a,list,but,ok"}, 201, None),
         ({"tags": [1, 2]}, 400, "array of strings"),
         ({"tags": ["bad tag!"]}, 400, "may contain only"),
@@ -229,17 +224,6 @@ def test_rejects_invalid_payloads(
     if fragment:
         assert fragment in body_of(response)["error"]
 
-
-def test_size_at_exactly_the_limit_is_accepted(aws, context, upload_payload):
-    response = post(context, upload_payload(sizeBytes=config.DEFAULT_MAX_IMAGE_BYTES))
-    assert response["statusCode"] == 201
-
-
-def test_size_limit_is_configurable(aws, context, upload_payload, monkeypatch):
-    monkeypatch.setenv("MAX_IMAGE_BYTES", "10")
-    response = post(context, upload_payload())
-    assert response["statusCode"] == 413
-    assert body_of(response)["code"] == "PayloadTooLarge"
 
 
 @pytest.mark.parametrize("body", [None, "", "not json", "[1,2,3]"])

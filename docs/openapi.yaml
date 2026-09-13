@@ -13,24 +13,26 @@ info:
 
     Image bytes never pass through this API. An upload takes three steps:
 
-    1. `POST /images` with the metadata and the file's size. The response holds
-       the image record (status `pending`) and a presigned S3 POST form.
+    1. `POST /images` with the metadata. The response holds the image record
+       (status `pending`) and a presigned S3 POST form.
     2. POST the file straight to S3 as `multipart/form-data`: every entry of
        `upload.fields` as a form field, then the file as the `upload.fileField`
        field, last. S3 enforces the signed policy - exact key, exact
-       Content-Type, and a body of exactly `sizeBytes` - and refuses anything
-       else with `400` or `403` before storing a byte.
+       Content-Type, and a body of 1 byte up to `upload.maxSizeBytes` - and
+       refuses anything else with `400` or `403` before storing a byte.
     3. S3 notifies an upload processor, which checks the file's magic bytes
-       against `contentType`, hashes it, and moves the image to `ready` (usually
-       within a couple of seconds) or `rejected` with a `rejectionReason`. Poll
-       `GET /images/{imageId}` to see the outcome.
+       against `contentType`, measures and hashes it, and moves the image to
+       `ready` (usually within a couple of seconds) or `rejected` with a
+       `rejectionReason`. Poll `GET /images/{imageId}` to see the outcome.
 
     Only `ready` images are listed or downloadable. A `pending` image whose file
     never arrives expires automatically.
 
     Because the bytes bypass API Gateway and Lambda, uploads are not bound by
     their payload limits (10 MB and 6 MB). The size ceiling is a product limit,
-    20 MB by default (`MAX_IMAGE_BYTES`), and is enforced by S3 itself.
+    20 MB by default (`MAX_IMAGE_BYTES`), and is enforced by S3 itself: an
+    oversized file is refused when uploaded, and the stored size is measured by
+    the processor.
 
     ## Identity
 
@@ -87,11 +89,10 @@ paths:
         presigned S3 POST form for the file itself. See **Uploading** above for
         the full flow.
 
-        No bytes are sent in this request. `sizeBytes` is required because it is
-        signed into the upload policy as an exact content-length, so S3 refuses a
-        body of any other size and the recorded size can be trusted. Declaring
-        more than the size limit fails here with `413`, before any upload is
-        attempted.
+        No bytes are sent in this request. The form accepts a file of
+        1 byte up to `upload.maxSizeBytes`; S3 refuses anything larger with
+        `400 EntityTooLarge`, so clients that want to fail before uploading
+        should compare their file against `maxSizeBytes` themselves.
 
         Unknown body fields are rejected rather than ignored - in particular
         `imageBase64`, which earlier versions of this API accepted.
@@ -109,13 +110,11 @@ paths:
                 value:
                   filename: sunset.png
                   contentType: image/png
-                  sizeBytes: 70
               full:
                 summary: With tags and a description
                 value:
                   filename: sunset.png
                   contentType: image/png
-                  sizeBytes: 70
                   tags: [beach, sunset]
                   description: Golden hour
       responses:
@@ -139,7 +138,6 @@ paths:
                   userId: alice
                   filename: sunset.png
                   contentType: image/png
-                  sizeBytes: 70
                   tags: [beach, sunset]
                   description: Golden hour
                   status: pending
@@ -148,6 +146,7 @@ paths:
                   method: POST
                   url: http://localhost:4566/monty-images-local-bucket
                   fileField: file
+                  maxSizeBytes: 20971520
                   fields:
                     Content-Type: image/png
                     key: images/alice/334d3b476eba4fbfa2b00e2aa4792a8a.png
@@ -163,8 +162,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
-        '413':
-          $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
         '500':
@@ -284,7 +281,6 @@ paths:
                     userId: alice
                     filename: sunset.png
                     contentType: image/png
-                    sizeBytes: 70
                     tags: [beach, sunset]
                     status: pending
                     createdAt: '2026-09-13T10:15:02.118Z'
@@ -308,7 +304,6 @@ paths:
                     userId: alice
                     filename: not-really.png
                     contentType: image/png
-                    sizeBytes: 35
                     tags: []
                     status: rejected
                     rejectionReason: "File content does not match the declared contentType 'image/png'"
@@ -592,7 +587,7 @@ components:
 
     RegisterImageRequest:
       type: object
-      required: [filename, contentType, sizeBytes]
+      required: [filename, contentType]
       additionalProperties: false
       properties:
         filename:
@@ -606,15 +601,6 @@ components:
           example: sunset.png
         contentType:
           $ref: '#/components/schemas/ContentType'
-        sizeBytes:
-          type: integer
-          minimum: 1
-          maximum: 20971520
-          description: |
-            Exact size of the file that will be uploaded, as a JSON integer (not a
-            string, float or boolean). Signed into the upload policy, so S3
-            refuses a body of any other size.
-          example: 70
         tags:
           type: array
           maxItems: 20
@@ -649,7 +635,7 @@ components:
         varies with the credentials that signed it (for example
         `x-amz-security-token` appears only for temporary credentials), so copy
         them all rather than naming them.
-      required: [method, url, fields, fileField, expiresAt, expiresInSeconds]
+      required: [method, url, fields, fileField, maxSizeBytes, expiresAt, expiresInSeconds]
       properties:
         method:
           type: string
@@ -674,11 +660,18 @@ components:
               example: image/png
             policy:
               type: string
-              description: Base64 JSON policy fixing the key, Content-Type and exact content length.
+              description: Base64 JSON policy fixing the key, the Content-Type and the allowed size range.
         fileField:
           type: string
           description: Name of the form field that must carry the file.
           example: file
+        maxSizeBytes:
+          type: integer
+          description: |
+            Largest file the form accepts. S3 refuses anything larger with
+            `400 EntityTooLarge`; check the file against it before uploading to
+            fail early.
+          example: 20971520
         expiresAt:
           type: string
           format: date-time
@@ -695,14 +688,13 @@ components:
         expiry timestamp exist on the stored item but are stripped from every
         response.
 
-        `checksumSha256` and `uploadedAt` are present only once the image is
-        `ready`; `rejectionReason` only when it is `rejected`.
+        `sizeBytes`, `checksumSha256` and `uploadedAt` are present only once the
+        image is `ready`; `rejectionReason` only when it is `rejected`.
       required:
         - imageId
         - userId
         - filename
         - contentType
-        - sizeBytes
         - tags
         - status
         - createdAt
@@ -723,7 +715,7 @@ components:
           $ref: '#/components/schemas/ContentType'
         sizeBytes:
           type: integer
-          description: Declared at registration, and verified against the stored object once ready.
+          description: Size of the stored file, measured by the processor. Ready images only.
           example: 70
         checksumSha256:
           type: string
@@ -811,7 +803,6 @@ components:
             - NotFound
             - Conflict
             - ImageNotReady
-            - PayloadTooLarge
             - UnsupportedMediaType
             - StorageError
             - InternalError
@@ -843,17 +834,17 @@ components:
           examples:
             missingField:
               value:
-                error: "'sizeBytes' is required"
+                error: "'filename' is required"
                 code: ValidationError
             wrongType:
-              summary: sizeBytes sent as a string
+              summary: tags sent as a number
               value:
-                error: "'sizeBytes' must be an integer"
+                error: "'tags' must be an array of strings"
                 code: ValidationError
             unknownField:
               summary: The retired base64 upload field
               value:
-                error: 'Unknown field(s): imageBase64. Allowed: contentType, description, filename, sizeBytes, tags'
+                error: 'Unknown field(s): imageBase64. Allowed: contentType, description, filename, tags'
                 code: ValidationError
             badToken:
               value:
@@ -899,16 +890,6 @@ components:
               value:
                 error: "Image '334d3b476eba4fbfa2b00e2aa4792a8a' was rejected: File content does not match the declared contentType 'image/png'"
                 code: ImageNotReady
-
-    PayloadTooLarge:
-      description: The declared `sizeBytes` exceeds `MAX_IMAGE_BYTES`.
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            error: Image is 26214400 bytes; the limit is 20971520 bytes
-            code: PayloadTooLarge
 
     UnsupportedMediaType:
       description: '`contentType` is not an accepted image type.'

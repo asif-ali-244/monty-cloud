@@ -43,13 +43,6 @@ class ImageNotReadyError(AppError):
     code = "ImageNotReady"
 
 
-class PayloadTooLargeError(AppError):
-    """Image exceeds the maximum accepted size."""
-
-    status_code = 413
-    code = "PayloadTooLarge"
-
-
 class UnsupportedMediaTypeError(AppError):
     """Content type is not an accepted image type."""
 

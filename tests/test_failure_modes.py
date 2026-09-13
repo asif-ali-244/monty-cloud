@@ -176,7 +176,7 @@ def test_failed_rejection_keeps_the_object_so_a_retry_can_finish(
     """
     from tests.conftest import PDF_BYTES, client_upload, process, register, s3_keys
 
-    registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+    registered = register(context, upload_payload())
     key = client_upload(registered, PDF_BYTES)
 
     def unavailable(*_args):

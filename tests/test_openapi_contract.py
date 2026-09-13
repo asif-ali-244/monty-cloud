@@ -148,7 +148,6 @@ class TestDocumentedConstantsMatchTheCode:
 
     def test_upload_field_limits(self, spec):
         upload = spec["components"]["schemas"]["RegisterImageRequest"]["properties"]
-        assert upload["sizeBytes"]["maximum"] == config.DEFAULT_MAX_IMAGE_BYTES
         assert upload["filename"]["maxLength"] == validation.MAX_FILENAME_LENGTH
         assert upload["description"]["maxLength"] == validation.MAX_DESCRIPTION_LENGTH
         assert upload["tags"]["maxItems"] == validation.MAX_TAGS
@@ -159,11 +158,12 @@ class TestDocumentedConstantsMatchTheCode:
         assert config.DEFAULT_MAX_IMAGE_BYTES == 20 * 1024 * 1024
         assert "20 MB" in spec["info"]["description"]
 
-    def test_upload_form_lifetime_matches_the_default(self, spec):
+    def test_upload_form_example_matches_the_defaults(self, spec):
         example = spec["paths"]["/images"]["post"]["responses"]["201"]["content"][
             "application/json"
         ]["example"]
         assert example["upload"]["expiresInSeconds"] == config.DEFAULT_UPLOAD_URL_TTL_SECONDS
+        assert example["upload"]["maxSizeBytes"] == config.DEFAULT_MAX_IMAGE_BYTES
 
 
 class TestRealResponsesMatchTheirDocumentedSchema:
@@ -191,7 +191,7 @@ class TestRealResponsesMatchTheirDocumentedSchema:
     def test_rejected_image(self, aws, context, upload_payload, schema_validator):
         from tests.conftest import PDF_BYTES, client_upload, fetch_image, process, register
 
-        registered = register(context, upload_payload(sizeBytes=len(PDF_BYTES)))
+        registered = register(context, upload_payload())
         process(context, client_upload(registered, PDF_BYTES))
         image = fetch_image(context, registered["image"]["imageId"])
         assert image["status"] == "rejected"
@@ -243,7 +243,6 @@ class TestRealResponsesMatchTheirDocumentedSchema:
             ("missing_identity", 400),
             ("not_found", 404),
             ("not_ready", 409),
-            ("too_large", 413),
             ("unsupported_type", 415),
         ],
     )
@@ -265,10 +264,6 @@ class TestRealResponsesMatchTheirDocumentedSchema:
             response = download_image.handler(
                 api_event("GET", path_parameters={"imageId": pending["image"]["imageId"]}),
                 context,
-            )
-        elif handler_call == "too_large":
-            response = upload_image.handler(
-                api_event("POST", body=upload_payload(sizeBytes=10**12)), context
             )
         else:
             response = upload_image.handler(

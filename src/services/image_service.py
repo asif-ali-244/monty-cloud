@@ -6,7 +6,8 @@ event notifications exist.
 Upload lifecycle
 ----------------
 1. ``register_upload`` records a ``pending`` row and returns a presigned POST.
-2. The client sends the file straight to S3; S3 enforces key, type and size.
+2. The client sends the file straight to S3; S3 enforces key, type and the
+   size limit.
 3. S3 emits ObjectCreated, and ``process_uploaded_object`` verifies the bytes
    and moves the row to ``ready`` - or to ``rejected``, deleting the object.
 
@@ -32,7 +33,7 @@ logger = logging.getLogger("images")
 _INTERNAL_FIELDS = ("s3Key", "s3Bucket", "filenameLower", "expiresAt")
 _IMAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _HASH_CHUNK_BYTES = 1024 * 1024
-REGISTER_FIELDS = ("filename", "contentType", "sizeBytes", "tags", "description")
+REGISTER_FIELDS = ("filename", "contentType", "tags", "description")
 
 
 def register_upload(user_id, payload):
@@ -51,7 +52,6 @@ def register_upload(user_id, payload):
     content_type = validation.validate_content_type(
         validation.require_string(payload, "contentType")
     )
-    size_bytes = validation.parse_size_bytes(payload.get("sizeBytes"))
     tags = validation.normalise_tags(payload.get("tags"))
     description = validation.require_string(
         payload, "description", validation.MAX_DESCRIPTION_LENGTH, required=False
@@ -72,7 +72,6 @@ def register_upload(user_id, payload):
         "filename": filename,
         "filenameLower": filename.lower(),
         "contentType": content_type,
-        "sizeBytes": size_bytes,
         "tags": tags,
         "status": repo.STATUS_PENDING,
         "createdAt": validation.to_iso(now),
@@ -83,8 +82,9 @@ def register_upload(user_id, payload):
     if description:
         item["description"] = description
 
+    max_bytes = config.max_image_bytes()
     repo.put_new(item)
-    form = object_store.presigned_post(s3_key, content_type, size_bytes, upload_ttl)
+    form = object_store.presigned_post(s3_key, content_type, max_bytes, upload_ttl)
 
     return {
         "image": to_public(item),
@@ -93,6 +93,7 @@ def register_upload(user_id, payload):
             "url": form["url"],
             "fields": form["fields"],
             "fileField": "file",
+            "maxSizeBytes": max_bytes,
             "expiresAt": validation.to_iso(upload_expires),
             "expiresInSeconds": upload_ttl,
         },
@@ -130,18 +131,17 @@ def process_uploaded_object(key):
     if head is None:
         return "object_missing"
 
-    problem = _check_declared_attributes(item, head)
+    max_bytes = config.max_image_bytes()
+    problem = _check_stored_attributes(item, head, max_bytes)
     checksum = size = None
     if problem is None:
         body = object_store.open_object(key)
         if body is None:
             return "object_missing"
         try:
-            checksum, size, problem = _hash_and_verify(body, item["contentType"])
+            checksum, size, problem = _hash_and_verify(body, item["contentType"], max_bytes)
         finally:
             body.close()
-        if problem is None and size != int(item["sizeBytes"]):
-            problem = f"Uploaded {size} bytes but {item['sizeBytes']} were declared"
 
     if problem is not None:
         return _reject(image_id, key, problem)
@@ -172,27 +172,28 @@ def _reject(image_id, key, reason):
     return "rejected"
 
 
-def _check_declared_attributes(item, head):
+def _check_stored_attributes(item, head, max_bytes):
     """Cheap checks from the object's metadata, before reading any bytes.
 
     The POST policy already enforces both, so these only fire if an object
     reached the key some other way. Defence in depth for the price of a HEAD.
     """
-    if int(head.get("ContentLength", -1)) != int(item["sizeBytes"]):
-        return (
-            f"Uploaded {head.get('ContentLength')} bytes but {item['sizeBytes']} were declared"
-        )
+    problem = _size_problem(int(head.get("ContentLength", 0)), max_bytes)
+    if problem:
+        return problem
     stored_type = (head.get("ContentType") or "").split(";")[0].strip().lower()
     if stored_type != item["contentType"]:
         return f"Uploaded as '{stored_type}' but '{item['contentType']}' was declared"
     return None
 
 
-def _hash_and_verify(body, content_type):
+def _hash_and_verify(body, content_type, max_bytes):
     """Stream the object once: check its magic bytes early, and hash all of it.
 
     Returns (sha256 hex, size, problem). A signature mismatch stops the read at
-    the first chunk rather than paying to hash a file that is being rejected.
+    the first chunk, and a body that grows past the limit stops it there, rather
+    than paying to hash a file that is being rejected. The size measured here -
+    not the earlier HEAD - is the one recorded.
     """
     digest = hashlib.sha256()
     size = 0
@@ -206,11 +207,20 @@ def _hash_and_verify(body, content_type):
                     return None, size, problem
         digest.update(chunk)
         size += len(chunk)
-    # Files shorter than the prefix never triggered the early check.
-    problem = _signature_problem(head, content_type)
+        if size > max_bytes:
+            return None, size, _size_problem(size, max_bytes)
+    problem = _size_problem(size, max_bytes) or _signature_problem(head, content_type)
     if problem:
         return None, size, problem
     return digest.hexdigest(), size, None
+
+
+def _size_problem(size, max_bytes):
+    if size < 1:
+        return "Uploaded file is empty"
+    if size > max_bytes:
+        return f"Uploaded {size} bytes; the limit is {max_bytes} bytes"
+    return None
 
 
 def _signature_problem(head, content_type):

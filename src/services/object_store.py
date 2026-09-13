@@ -13,13 +13,13 @@ from src.common.errors import StorageError
 _MISSING = ("NoSuchKey", "404", "NotFound")
 
 
-def presigned_post(key, content_type, size_bytes, expires_in):
+def presigned_post(key, content_type, max_bytes, expires_in):
     """Sign a browser-compatible POST that can create exactly one object.
 
     A POST policy is used instead of a presigned PUT because only a policy can
     constrain the body. S3 itself enforces every condition below, before a byte
-    is stored: the exact key, the exact Content-Type, and a content-length range
-    pinned to the declared size. Any mismatch is refused with 400/403.
+    is stored: the exact key, the exact Content-Type, and a body of 1 byte up to
+    the size limit. Anything else is refused with 400/403.
     """
     try:
         return config.s3_signing_client().generate_presigned_post(
@@ -28,7 +28,7 @@ def presigned_post(key, content_type, size_bytes, expires_in):
             Fields={"Content-Type": content_type},
             Conditions=[
                 {"Content-Type": content_type},
-                ["content-length-range", size_bytes, size_bytes],
+                ["content-length-range", 1, max_bytes],
             ],
             ExpiresIn=expires_in,
         )

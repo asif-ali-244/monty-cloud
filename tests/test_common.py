@@ -9,7 +9,6 @@ from src.common import config, responses, validation
 from src.common.errors import (
     AppError,
     NotFoundError,
-    PayloadTooLargeError,
     UnsupportedMediaTypeError,
     ValidationError,
 )
@@ -110,31 +109,6 @@ class TestTags:
     def test_rejects_invalid(self, given):
         with pytest.raises(ValidationError):
             validation.normalise_tags(given)
-
-
-class TestSizeBytes:
-    @pytest.mark.parametrize("given", [1, 70, config.DEFAULT_MAX_IMAGE_BYTES])
-    def test_accepts_positive_integers_up_to_the_limit(self, given):
-        assert validation.parse_size_bytes(given) == given
-
-    @pytest.mark.parametrize("given", ["70", 70.0, 70.5, True, False, [70], {"n": 70}])
-    def test_rejects_anything_that_is_not_a_json_integer(self, given):
-        """bool is an int subclass in Python; a JSON `true` must not pass as 1 byte."""
-        with pytest.raises(ValidationError, match="must be an integer"):
-            validation.parse_size_bytes(given)
-
-    def test_missing_is_required_not_a_type_error(self):
-        with pytest.raises(ValidationError, match="is required"):
-            validation.parse_size_bytes(None)
-
-    @pytest.mark.parametrize("given", [0, -1])
-    def test_rejects_non_positive(self, given):
-        with pytest.raises(ValidationError, match="at least 1"):
-            validation.parse_size_bytes(given)
-
-    def test_over_the_limit_is_413_not_400(self):
-        with pytest.raises(PayloadTooLargeError):
-            validation.parse_size_bytes(config.DEFAULT_MAX_IMAGE_BYTES + 1)
 
 
 class TestSignatures:

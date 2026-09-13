@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Image Service API",
-    "description": "Register, upload, search, retrieve and delete images.\n\nRun the collection top to bottom (Collection Runner, or newman). Step 1 registers an image, step 3 uploads the file straight to S3 with the signed form from step 1, and step 4 polls until the S3-triggered processor has verified it. Every later request reuses the captured `imageId`.\n\nBefore running, set `baseUrl` from `terraform -chdir=terraform output -raw api_base_url`. The upload step sends `docs/sample.png` (70 bytes, matching `fileSize`), resolved against Postman's working directory - set that to the repository root, or pick another PNG and set `fileSize` to its exact size in bytes.\n\nFrom the command line:\n`npx newman run docs/postman_collection.json --env-var baseUrl=$(terraform -chdir=terraform output -raw api_base_url)`",
+    "description": "Register, upload, search, retrieve and delete images.\n\nRun the collection top to bottom (Collection Runner, or newman). Step 1 registers an image, step 3 uploads the file straight to S3 with the signed form from step 1, and step 4 polls until the S3-triggered processor has verified it. Every later request reuses the captured `imageId`.\n\nBefore running, set the `baseUrl` collection variable's **Current value** (Postman sends Current, not Initial) to the output of `terraform -chdir=terraform output -raw api_base_url`. The REST API id in that URL changes every time LocalStack restarts, so refresh it after a restart. The upload step sends `docs/sample.png`, resolved against Postman's working directory - set that to the repository root, or pick any other image up to 20 MB.\n\nFrom the command line:\n`npx newman run docs/postman_collection.json --env-var baseUrl=$(terraform -chdir=terraform output -raw api_base_url)`",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -14,11 +14,6 @@
       "key": "userId",
       "value": "alice",
       "description": "Development stand-in for an authenticated identity."
-    },
-    {
-      "key": "fileSize",
-      "value": "70",
-      "description": "Exact size in bytes of the file sent in step 3. docs/sample.png is 70."
     },
     {
       "key": "imageId",
@@ -50,19 +45,23 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('201 Created', () => pm.response.to.have.status(201));",
-              "const { image, upload } = pm.response.json();",
-              "pm.test('image starts pending', () => pm.expect(image.status).to.eql('pending'));",
-              "pm.test('records the uploader', () => pm.expect(image.userId).to.eql(pm.collectionVariables.get('userId')));",
-              "pm.test('returns a POST form for S3', () => {",
-              "  pm.expect(upload.method).to.eql('POST');",
-              "  pm.expect(upload.fields).to.include.keys('key', 'policy', 'Content-Type');",
-              "});",
-              "pm.test('hides storage internals', () => pm.expect(image).to.not.have.property('s3Key'));",
-              "pm.collectionVariables.set('imageId', image.imageId);",
-              "pm.collectionVariables.set('uploadUrl', upload.url);",
-              "pm.collectionVariables.set('uploadForm', JSON.stringify(upload));",
-              "pm.collectionVariables.set('pollAttempts', 0);"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "  const { image, upload } = pm.response.json();",
+              "  pm.test('image starts pending', () => pm.expect(image.status).to.eql('pending'));",
+              "  pm.test('records the uploader', () => pm.expect(image.userId).to.eql(pm.collectionVariables.get('userId')));",
+              "  pm.test('returns a POST form for S3', () => {",
+              "    pm.expect(upload.method).to.eql('POST');",
+              "    pm.expect(upload.fields).to.include.keys('key', 'policy', 'Content-Type');",
+              "  });",
+              "  pm.test('advertises the size limit', () => pm.expect(upload.maxSizeBytes).to.be.a('number').and.above(0));",
+              "  pm.test('hides storage internals', () => pm.expect(image).to.not.have.property('s3Key'));",
+              "  pm.collectionVariables.set('imageId', image.imageId);",
+              "  pm.collectionVariables.set('uploadUrl', upload.url);",
+              "  pm.collectionVariables.set('uploadForm', JSON.stringify(upload));",
+              "  pm.collectionVariables.set('pollAttempts', 0);",
+              "}"
             ]
           }
         }
@@ -81,7 +80,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"filename\": \"sample.png\",\n  \"contentType\": \"image/png\",\n  \"sizeBytes\": {{fileSize}},\n  \"tags\": [\"beach\", \"sunset\"],\n  \"description\": \"Golden hour\"\n}",
+          "raw": "{\n  \"filename\": \"sample.png\",\n  \"contentType\": \"image/png\",\n  \"tags\": [\n    \"beach\",\n    \"sunset\"\n  ],\n  \"description\": \"Golden hour\"\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -97,7 +96,7 @@
             "images"
           ]
         },
-        "description": "Records the metadata with status `pending` and returns a presigned S3 POST form. No bytes are sent. `sizeBytes` must be the exact size of the file chosen in step 3."
+        "description": "Records the metadata with status `pending` and returns a presigned S3 POST form. No bytes are sent."
       }
     },
     {
@@ -108,8 +107,11 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('409 while pending', () => pm.response.to.have.status(409));",
-              "pm.test('code is ImageNotReady', () => pm.expect(pm.response.json().code).to.eql('ImageNotReady'));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('409 while pending', () => pm.response.to.have.status(409));",
+              "  pm.test('code is ImageNotReady', () => pm.expect(pm.response.json().code).to.eql('ImageNotReady'));",
+              "}"
             ]
           }
         }
@@ -142,7 +144,11 @@
               "// The signed fields vary with the credentials that signed them, so the",
               "// form is rebuilt from the registration response rather than hard-coded.",
               "// S3 requires the file to be the last field.",
-              "const upload = JSON.parse(pm.collectionVariables.get('uploadForm'));",
+              "const captured = pm.collectionVariables.get('uploadForm');",
+              "if (!captured) {",
+              "  throw new Error('No upload form captured: step 1 (Register image) has to succeed first.');",
+              "}",
+              "const upload = JSON.parse(captured);",
               "const file = pm.request.body.formdata.find((param) => param.key === upload.fileField);",
               "pm.request.body.formdata.clear();",
               "Object.entries(upload.fields).forEach(([key, value]) => {",
@@ -172,7 +178,7 @@
               "key": "file",
               "type": "file",
               "src": "docs/sample.png",
-              "description": "Any PNG - set fileSize to its exact size in bytes first."
+              "description": "Any image up to upload.maxSizeBytes."
             }
           ]
         },
@@ -182,7 +188,7 @@
             "{{uploadUrl}}"
           ]
         },
-        "description": "Sent to S3, not to the API. The pre-request script adds every signed field from step 1 ahead of the file. S3 enforces the policy: a file of a different size than `fileSize` is refused with 400."
+        "description": "Sent to S3, not to the API. The pre-request script adds every signed field from step 1 ahead of the file. S3 enforces the policy: an empty file or one over the size limit is refused with 400."
       }
     },
     {
@@ -205,16 +211,19 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "const image = pm.response.json();",
-              "const attempts = Number(pm.collectionVariables.get('pollAttempts')) + 1;",
-              "pm.collectionVariables.set('pollAttempts', attempts);",
-              "if (image.status === 'pending' && attempts < 30) {",
-              "  // Re-run this request. Works in the collection runner and newman, not on a single Send.",
-              "  postman.setNextRequest(pm.info.requestName);",
-              "} else {",
-              "  pm.test('image is ready', () => pm.expect(image.status).to.eql('ready'));",
-              "  pm.test('checksum is recorded', () => pm.expect(image.checksumSha256).to.match(/^[0-9a-f]{64}$/));",
-              "  pm.test('size matches the declaration', () => pm.expect(image.sizeBytes).to.eql(Number(pm.collectionVariables.get('fileSize'))));",
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  const image = pm.response.json();",
+              "  const attempts = Number(pm.collectionVariables.get('pollAttempts')) + 1;",
+              "  pm.collectionVariables.set('pollAttempts', attempts);",
+              "  if (image.status === 'pending' && attempts < 30) {",
+              "    // Re-run this request. Works in the collection runner and newman, not on a single Send.",
+              "    postman.setNextRequest(pm.info.requestName);",
+              "  } else {",
+              "    pm.test('image is ready', () => pm.expect(image.status).to.eql('ready'));",
+              "    pm.test('checksum is recorded', () => pm.expect(image.checksumSha256).to.match(/^[0-9a-f]{64}$/));",
+              "    pm.test('size is measured and recorded', () => pm.expect(image.sizeBytes).to.be.a('number').and.above(0));",
+              "  }",
               "}"
             ]
           }
@@ -244,8 +253,11 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
-              "pm.test('names the field', () => pm.expect(pm.response.json().error).to.include('imageBase64'));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+              "  pm.test('names the field', () => pm.expect(pm.response.json().error).to.include('imageBase64'));",
+              "}"
             ]
           }
         }
@@ -264,53 +276,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"filename\": \"old-client.png\",\n  \"contentType\": \"image/png\",\n  \"sizeBytes\": 70,\n  \"imageBase64\": \"iVBORw0KGgo=\"\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        },
-        "url": {
-          "raw": "{{baseUrl}}/images",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "images"
-          ]
-        }
-      }
-    },
-    {
-      "name": "Register - rejects an oversized declaration",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "type": "text/javascript",
-            "exec": [
-              "pm.test('413 Payload Too Large', () => pm.response.to.have.status(413));",
-              "pm.test('code is PayloadTooLarge', () => pm.expect(pm.response.json().code).to.eql('PayloadTooLarge'));"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "X-User-Id",
-            "value": "{{userId}}"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"filename\": \"huge.png\",\n  \"contentType\": \"image/png\",\n  \"sizeBytes\": 26214400\n}",
+          "raw": "{\n  \"filename\": \"old-client.png\",\n  \"contentType\": \"image/png\",\n  \"imageBase64\": \"iVBORw0KGgo=\"\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -336,11 +302,14 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('200 OK', () => pm.response.to.have.status(200));",
-              "const body = pm.response.json();",
-              "pm.test('returns a page', () => pm.expect(body).to.have.all.keys('items', 'count', 'nextToken'));",
-              "pm.test('count matches the page', () => pm.expect(body.count).to.eql(body.items.length));",
-              "pm.test('only ready images are listed', () => body.items.forEach((i) => pm.expect(i.status).to.eql('ready')));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "  const body = pm.response.json();",
+              "  pm.test('returns a page', () => pm.expect(body).to.have.all.keys('items', 'count', 'nextToken'));",
+              "  pm.test('count matches the page', () => pm.expect(body.count).to.eql(body.items.length));",
+              "  pm.test('only ready images are listed', () => body.items.forEach((i) => pm.expect(i.status).to.eql('ready')));",
+              "}"
             ]
           }
         }
@@ -374,16 +343,19 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('200 OK', () => pm.response.to.have.status(200));",
-              "const items = pm.response.json().items;",
-              "pm.test('every result matches both filters', () => items.forEach((i) => {",
-              "  pm.expect(i.userId).to.eql(pm.collectionVariables.get('userId'));",
-              "  pm.expect(i.tags).to.include('beach');",
-              "}));",
-              "pm.test('newest first', () => {",
-              "  const dates = items.map((i) => i.uploadedAt);",
-              "  pm.expect(dates).to.eql([...dates].sort().reverse());",
-              "});"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "  const items = pm.response.json().items;",
+              "  pm.test('every result matches both filters', () => items.forEach((i) => {",
+              "    pm.expect(i.userId).to.eql(pm.collectionVariables.get('userId'));",
+              "    pm.expect(i.tags).to.include('beach');",
+              "  }));",
+              "  pm.test('newest first', () => {",
+              "    const dates = items.map((i) => i.uploadedAt);",
+              "    pm.expect(dates).to.eql([...dates].sort().reverse());",
+              "  });",
+              "}"
             ]
           }
         }
@@ -467,8 +439,11 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
-              "pm.test('names the parameter', () => pm.expect(pm.response.json().error).to.include('nextToken'));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+              "  pm.test('names the parameter', () => pm.expect(pm.response.json().error).to.include('nextToken'));",
+              "}"
             ]
           }
         }
@@ -501,10 +476,13 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('200 OK', () => pm.response.to.have.status(200));",
-              "const image = pm.response.json();",
-              "pm.test('is the uploaded image', () => pm.expect(image.imageId).to.eql(pm.collectionVariables.get('imageId')));",
-              "pm.test('is ready', () => pm.expect(image.status).to.eql('ready'));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "  const image = pm.response.json();",
+              "  pm.test('is the uploaded image', () => pm.expect(image.imageId).to.eql(pm.collectionVariables.get('imageId')));",
+              "  pm.test('is ready', () => pm.expect(image.status).to.eql('ready'));",
+              "}"
             ]
           }
         }
@@ -532,8 +510,11 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
-              "pm.test('code is NotFound', () => pm.expect(pm.response.json().code).to.eql('NotFound'));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+              "  pm.test('code is NotFound', () => pm.expect(pm.response.json().code).to.eql('NotFound'));",
+              "}"
             ]
           }
         }
@@ -593,10 +574,13 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('200 OK', () => pm.response.to.have.status(200));",
-              "const body = pm.response.json();",
-              "pm.test('returns a signed URL', () => pm.expect(body.downloadUrl).to.include('X-Amz-Signature'));",
-              "pm.test('honours expiresIn', () => pm.expect(body.expiresInSeconds).to.eql(60));"
+              "// Empty body: the collection-level test reports why.",
+              "if (pm.response.text() !== '') {",
+              "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "  const body = pm.response.json();",
+              "  pm.test('returns a signed URL', () => pm.expect(body.downloadUrl).to.include('X-Amz-Signature'));",
+              "  pm.test('honours expiresIn', () => pm.expect(body.expiresInSeconds).to.eql(60));",
+              "}"
             ]
           }
         }
@@ -693,6 +677,42 @@
           ]
         },
         "description": "Deleting twice reports 404 rather than pretending the call did work."
+      }
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Fail fast, and say why, when baseUrl was never set.",
+          "const baseUrl = pm.variables.get('baseUrl') || '';",
+          "if (!/^https?:\\/\\//.test(baseUrl) || baseUrl.includes('REPLACE_ME')) {",
+          "  throw new Error(",
+          "    'baseUrl is not set. Put the output of `terraform -chdir=terraform output -raw api_base_url` in the ' +",
+          "    \"baseUrl collection variable's CURRENT value (Postman sends Current, not Initial).\"",
+          "  );",
+          "}"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Every API response has a JSON body except a 204. An empty body almost always",
+          "// means the request never reached the API: LocalStack answers an unknown REST API",
+          "// id with an empty 404, and the id changes each time LocalStack restarts.",
+          "if (pm.response.code !== 204 && pm.response.text() === '') {",
+          "  pm.test(",
+          "    `Got ${pm.response.code} with an empty body from ${pm.request.url.getHost()}${pm.request.url.getPath()}: ` +",
+          "      'baseUrl is wrong or stale. Refresh it from `terraform -chdir=terraform output -raw api_base_url`',",
+          "    () => pm.expect.fail('empty response body')",
+          "  );",
+          "}"
+        ]
       }
     }
   ]
