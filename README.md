@@ -360,8 +360,7 @@ internal message cannot leak.
 
 ## Known limitations
 
-- **No authentication.** `X-User-Id` is trusted, which is fine for an assessment
-  and not for anything else. The handler-side plumbing for a real authorizer is
+- **No authentication.** `X-User-Id` is trusted. The handler-side plumbing for a real authorizer is
   already in place.
 - **No authorisation.** Any caller can read or delete any image by id. Ownership
   is recorded but not enforced; enforcing it is a conditional expression on the
